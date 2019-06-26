@@ -19,11 +19,13 @@ TEST_DICOM_STORE_ID = 'dicom-images-test'
 def download_instance(dicom_web_url, dicom_store_id, study_uid, series_uid,
                       instance_uid, credentials):
     """Downloads a DICOM instance and saves it under the current folder."""
-    instance_url = posixpath.join(dicom_web_url, 'studies', study_uid, 'series',
-                                  series_uid, 'instances', instance_uid)
+    instance_url = posixpath.join(
+        dicom_web_url, 'studies', study_uid, 'series', series_uid,
+        'instances', instance_uid)
     authed_session = AuthorizedSession(credentials)
     response = authed_session.get(
-        instance_url, headers={'Accept': 'application/dicom; transfer-syntax=*'})
+        instance_url,
+        headers={'Accept': 'application/dicom; transfer-syntax=*'})
     file_path = posixpath.join(dicom_store_id, study_uid, series_uid,
                                instance_uid)
     filename = '%s.dcm' % file_path
@@ -36,9 +38,9 @@ def download_instance(dicom_web_url, dicom_store_id, study_uid, series_uid,
 def download_all_instances(dicom_store_id, credentials):
     """Downloads all DICOM instances in the specified DICOM store."""
     # Get a list of all instances.
-    dicom_web_url = posixpath.join(CHC_API_URL, 'projects', PROJECT_ID,
-                                   'locations', REGION, 'datasets', DATASET_ID,
-                                   'dicomStores', dicom_store_id, 'dicomWeb')
+    dicom_web_url = posixpath.join(
+        CHC_API_URL, 'projects', PROJECT_ID, 'locations', REGION, 'datasets',
+        DATASET_ID, 'dicomStores', dicom_store_id, 'dicomWeb')
     qido_url = posixpath.join(dicom_web_url, 'instances')
     authed_session = AuthorizedSession(credentials)
     response = authed_session.get(qido_url, params={'limit': '15000'})
@@ -57,8 +59,9 @@ def download_all_instances(dicom_store_id, credentials):
             study_uid = instance[study_instance_uid_tag][value_key][0]
             series_uid = instance[series_instance_uid_tag][value_key][0]
             instance_uid = instance[sop_instance_uid_tag][value_key][0]
-            future = executor.submit(download_instance, dicom_web_url, dicom_store_id,
-                                     study_uid, series_uid, instance_uid, credentials)
+            future = executor.submit(
+                download_instance, dicom_web_url, dicom_store_id, study_uid,
+                series_uid, instance_uid, credentials)
             future_to_study_uid[future] = study_uid
         processed_count = 0
         for future in futures.as_completed(future_to_study_uid):
@@ -75,7 +78,8 @@ def download_all_instances(dicom_store_id, credentials):
 
 def main(argv=None):
     credentials, _ = google.auth.default()
-    print('Downloading all instances in %s DICOM store' % TRAIN_DICOM_STORE_ID)
+    print('Downloading all instances in %s DICOM store' %
+          TRAIN_DICOM_STORE_ID)
     download_all_instances(TRAIN_DICOM_STORE_ID, credentials)
     print('Downloading all instances in %s DICOM store' % TEST_DICOM_STORE_ID)
     download_all_instances(TEST_DICOM_STORE_ID, credentials)
