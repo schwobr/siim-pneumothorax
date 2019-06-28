@@ -4,9 +4,9 @@ from torch.utils.data import WeightedRandomSampler
 
 
 class WeightList:
-    def __init__(self, counter=None, classes=[]):
-        assert isinstance(classes, list), "weights and classes must be lists"
-        self._counter = counter if counter is not None else np.zeros(1)
+    def __init__(self, counter, classes=[]):
+        assert isinstance(classes, list), "classes must be lists"
+        self._counter = counter
         self._classes = classes
 
     def __len__(self):
@@ -35,7 +35,7 @@ class WeightList:
 
 
 def create_sampler(train_list):
-    weights = WeightList(counter=np.zeros(train_list.c))
+    weights = WeightList(np.zeros(train_list.c), classes=[])
     for _, c in tqdm(train_list.train):
         weights.increment(c.data)
         weights.append(c.data)
