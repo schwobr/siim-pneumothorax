@@ -30,6 +30,8 @@ def mask2rle(img, width, height):
 
 
 def rle2mask(rle, width, height):
+    if rle == '-1':
+        return np.zeros((width, height))
     mask = np.zeros(width * height)
     array = np.asarray([int(x) for x in rle.split()])
     starts = array[0::2]
@@ -41,4 +43,4 @@ def rle2mask(rle, width, height):
         mask[current_position:current_position+lengths[index]] = 255
         current_position += lengths[index]
 
-    return mask.reshape(width, height)
+    return mask.reshape(width, height).T
