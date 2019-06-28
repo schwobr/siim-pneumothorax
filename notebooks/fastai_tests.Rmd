@@ -1,0 +1,505 @@
+---
+jupyter:
+  jupytext:
+    text_representation:
+      extension: .Rmd
+      format_name: rmarkdown
+      format_version: '1.1'
+      jupytext_version: 1.1.3
+  kernelspec:
+    display_name: Python [conda env:pytorch] *
+    language: python
+    name: conda-env-pytorch-py
+---
+
+```{python}
+import cv2
+import PIL
+import random
+import numpy as np
+import os
+import pydicom
+import matplotlib.pyplot as plt
+import pandas as pd
+from tqdm import tqdm_notebook as tqdm
+
+from torchvision import transforms
+import torchvision.transforms.functional as TF
+from torch.nn.functional import binary_cross_entropy_with_logits
+import torch
+import torch.nn as nn
+from torch.utils.data import WeightedRandomSampler
+
+from fastai.vision.data import SegmentationItemList, SegmentationLabelList, ImageList
+from fastai.data_block import FloatList, FloatItem
+from fastai.vision.image import Image, ImageSegment, image2np, pil2tensor
+from fastai.vision.transform import get_transforms
+from fastai.vision.learner import unet_learner, cnn_learner
+import fastai.vision.models as mod
+from fastai.callbacks import SaveModelCallback
+from fastai.metrics import accuracy
+
+from pathlib import Path
+
+# IMAGE SIZES
+TRAIN_SIZE = 256
+MAX_SIZE = 1388
+TEST_SIZE = 224
+TEST_OVERLAP = 64
+IMG_CHANNELS = 3
+
+# PATHS
+PROJECT_PATH = Path(
+    '/work/stages/schwob/siim-pneumothorax')
+FULL_TRAIN_PATH = PROJECT_PATH/'data/dicom-images-train'
+FULL_TEST_PATH = PROJECT_PATH/'data/dicom-images-test'
+TRAIN_PATH = PROJECT_PATH/'data/train'
+TEST_PATH = PROJECT_PATH/'data/test'
+MODELS_PATH = PROJECT_PATH/'models/'
+SUB_PATH = PROJECT_PATH/'submissions/'
+LABELS_OLD = PROJECT_PATH/'data/train-rle.csv'
+LABELS = PROJECT_PATH/'data/train-rle-fastai1.csv'
+LABELS_CLASSIF = PROJECT_PATH/'data/train-rle-fastai-classif.csv'
+LOG = Path('/work/stages/schwob/runs')
+
+# LEARNER CONFIG
+BATCH_SIZE = 4
+WD = 0.1
+LR = 1e-2
+GROUP_LIMITS = None
+FREEZE_UNTIL = None
+EPOCHS = 10
+UNFROZE_EPOCHS = 10
+PRETRAINED = True
+MODEL = 'resnet34'
+CLASSES = ['pneum']
+ACT = 'sigmoid'
+```
+
+```{python}
+models = {
+    'resnet34': mod.resnet34, 'resnet50': mod.resnet50,
+    'resnet101': mod.resnet101, 'resnet125': mod.resnet152}
+```
+
+```{python}
+def restruct(src, dest):
+    for fn in src.glob('**/*dcm'):
+        ds = pydicom.dcmread(str(fn))
+        pydicom.dcmwrite(str(dest/fn.name), ds)
+```
+
+```{python}
+#restruct(FULL_TRAIN_PATH, TRAIN_PATH)
+```
+
+```{python}
+#restruct(FULL_TEST_PATH, TEST_PATH)
+```
+
+```{python}
+def change_csv(old, new, path):
+    df = pd.read_csv(old, sep=', ')
+    new_df = pd.DataFrame(columns=['ImageId', 'EncodedPixels'])
+    for row in df.itertuples():
+        image_id = row.ImageId
+        label = row.EncodedPixels
+        image_id = Path(path.name)/(image_id+'.dcm')
+        new_df.loc[row.Index] = [image_id, label]
+    new_df.to_csv(new, index=False)
+```
+
+```{python}
+#change_csv(LABELS_OLD, LABELS, TRAIN_PATH)
+```
+
+```{python}
+df = pd.read_csv(LABELS, header='infer')
+df.head()
+```
+
+```{python}
+df.shape
+```
+
+```{python}
+df['ImageId'].unique().shape
+```
+
+```{python}
+def merge_doubles(old, new):
+    df = pd.read_csv(old)
+    new_df = pd.DataFrame(columns=['ImageId', 'EncodedPixels'])
+    for k, id in enumerate(df['ImageId'].unique()):
+        rles = []
+        for rle in df.loc[df['ImageId']==id, 'EncodedPixels']:
+            rles.append(rle)
+        new_df.loc[k] = [id, ' '.join(rles)]
+    new_df.to_csv(new, index=False)
+```
+
+```{python}
+def create_classif_csv(old, new):
+    df = pd.read_csv(old)
+    new_df = pd.DataFrame(columns=['ImageId', 'Labels'])
+    for row in df.itertuples():
+        image_id = row.ImageId
+        rle = row.EncodedPixels
+        new_df.loc[row.Index] = [image_id, 1 if rle!='-1' else 0]
+    new_df.to_csv(new, index=False)
+```
+
+```{python}
+create_classif_csv(LABELS, LABELS_CLASSIF)
+```
+
+```{python}
+def open_image(fn):
+    return pydicom.dcmread(str(fn)).pixel_array
+
+def show(img, figsize=(10, 10)):
+    plt.figure(figsize=figsize)
+    plt.axis('off')
+    plt.imshow(img, cmap=plt.cm.bone)
+    plt.show()
+```
+
+```{python}
+fn = next(TRAIN_PATH.glob('**/*.dcm'))
+img = open_image(fn)
+show(img)
+```
+
+```{python}
+img.shape
+```
+
+```{python}
+def mask2rle(img, width, height):
+    rle = []
+    lastColor = 0
+    currentPixel = 0
+    runStart = -1
+    runLength = 0
+
+    for x in range(width):
+        for y in range(height):
+            currentColor = img[x][y]
+            if currentColor != lastColor:
+                if currentColor == 255:
+                    runStart = currentPixel
+                    runLength = 1
+                else:
+                    rle.append(str(runStart))
+                    rle.append(str(runLength))
+                    runStart = -1
+                    runLength = 0
+                    currentPixel = 0
+            elif runStart > -1:
+                runLength += 1
+            lastColor = currentColor
+            currentPixel += 1
+
+    return " ".join(rle)
+```
+
+```{python}
+def rle2mask(rle, width, height):
+    if rle == '-1':
+        return np.zeros((width, height))
+    mask = np.zeros(width * height)
+    array = np.asarray([int(x) for x in rle.split()])
+    starts = array[0::2]
+    lengths = array[1::2]
+
+    current_position = 0
+    for index, start in enumerate(starts):
+        current_position += start
+        mask[current_position:current_position+lengths[index]] = 255
+        current_position += lengths[index]
+
+    return mask.reshape(width, height).T
+```
+
+```{python}
+class PneumoSegmentationList(SegmentationItemList):
+    def open(self, fn):
+        x = open_image(fn)
+        x = pil2tensor(x, np.float32)
+        x = torch.cat((x, x, x))
+        return Image(x/255)
+```
+
+```{python}
+class ImageSegmentFloat(ImageSegment):
+    @property
+    def data(self):
+        return self.px.float()
+```
+
+```{python}
+class MaskList(SegmentationLabelList):
+    def __init__(self, *args, train_path=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.train_path = train_path
+        
+    def open(self, fn):
+        assert self.train_path, "a path for train set must be specified"
+        img_path = fn[0]
+        rle = fn[1]
+        h, w = open_image(self.train_path/img_path).shape
+        y = rle2mask(rle, w, h)
+        y = pil2tensor(y, np.float32)
+        return ImageSegmentFloat(y/255)
+    
+    def analyze_pred(self, pred, thresh: float = 0.5):
+        return (pred > thresh).float()
+    
+    def reconstruct(self, t):
+        return ImageSegmentFloat(t.float())
+```
+
+```{python}
+class PneumoClassifList(ImageList):
+    def open(self, fn):
+        x = open_image(fn)
+        x = pil2tensor(x, np.float32)
+        x = torch.cat((x, x, x))
+        return Image(x/255)
+```
+
+```{python}
+class WeightList:
+    def __init__(self, counter=None, classes=[]):
+        assert isinstance(classes, list), "weights and classes must be lists"
+        self._counter = counter if counter is not None else np.zeros(1)
+        self._classes = classes
+        
+    def __len__(self):
+        return len(self._classes)
+    
+    def __getitem__(self, key):
+        return self._counter[self._classes[key]]
+    
+    def __iter__(self):
+        return iter([self._counter[c] for c in self._classes])
+        
+    def append(self, c):
+        self._classes.append(c)
+        
+    def pop(self, key):
+        self._classes.pop(key)
+        
+    def increment(self, c):
+        self._counter[c] += 1
+        
+    def inverse(self):
+        self._counter = 1/self._counter
+        
+    def tolist(self):
+        return [self._counter[c] for c in self._classes]
+```
+
+```{python}
+def create_sampler(train_list):
+    weights = WeightList(counter=np.zeros(train_list.c))
+    for _, c in tqdm(train_list.train):
+        weights.increment(c.data)
+        weights.append(c.data)
+    weights.inverse()
+    sampler = WeightedRandomSampler(weights.tolist(), len(weights))
+    return sampler
+```
+
+```{python}
+def load_data(path, bs=8, train_size=256):
+    train_list = (PneumoSegmentationList.
+                  from_csv(path.parent, path.name).
+                  split_by_rand_pct(valid_pct=0.2).
+                  label_from_df(cols=[0, 1], classes=['pneum'], label_cls=MaskList, train_path=path.parent).
+                  transform(get_transforms(), size=train_size, tfm_y=True).
+                  databunch(bs=bs, num_workers=0))
+    return train_list
+```
+
+```{python}
+def load_data_classif(path, bs=8, train_size=256, weight_sample=True):
+    train_list = (PneumoClassifList.
+                  from_csv(path.parent, path.name).
+                  split_by_rand_pct(valid_pct=0.2).
+                  label_from_df().
+                  transform(get_transforms(), size=train_size))
+    if weight_sample:
+        #shuffle = False
+        sampler = create_sampler(train_list)
+    else:
+        #shuffle = True
+        sampler = None
+    train_list = train_list.databunch(bs=bs, num_workers=0, sampler=sampler).normalize()
+    return train_list
+```
+
+```{python}
+db = load_data(LABELS, bs=BATCH_SIZE, train_size=TRAIN_SIZE)
+```
+
+```{python}
+db.train_ds[0][1].px
+```
+
+```{python}
+db.show_batch(cmap=plt.cm.bone)
+```
+
+```{python}
+def dice(input, target, smooth=1.):
+    iflat = torch.sigmoid(input).view(-1)
+    tflat = target.view(-1)
+    intersection = (iflat * tflat).sum()
+    
+    return (2. * intersection + smooth)/(iflat.sum() + tflat.sum() + smooth)
+```
+
+```{python}
+def dice_loss(input, target, smooth=1e-2):
+    return 1-dice(input, target, smooth=smooth)
+```
+
+```{python}
+def bce_dice_loss(input, target, a=0.5, b=0.5, smooth=1.):
+    return a*dice_loss(input, target, smooth=smooth)+b*binary_cross_entropy_with_logits(input, target)
+```
+
+```{python}
+class DiceLoss(nn.Module):
+    def __init__(self, smooth=1.):
+        super().__init__()
+        self.smooth = smooth
+    
+    def forward(self, input, target):
+        return dice_loss(input, target, smooth=self.smooth)
+```
+
+```{python}
+class BCEDiceLoss(nn.Module):
+    def __init__(self, a=0.5, b=0.5, smooth=1.):
+        super().__init__()
+        self.a = a
+        self.b = b
+        self.smooth = smooth
+        
+    def forward(self, input, target):
+        return bce_dice_loss(input, target, a=self.a, b=self.b, smooth=self.smooth)
+```
+
+```{python}
+learner = unet_learner(db, models[MODEL], pretrained=PRETRAINED, loss_func=DiceLoss(), wd=WD, model_dir=MODELS_PATH, metrics=[dice])
+```
+
+```{python}
+learner.lr_find(num_it=2000)
+```
+
+```{python}
+learner.recorder.plot(skip_end=1)
+```
+
+```{python}
+learner.fit_one_cycle(
+    10, slice(LR),
+    callbacks=[
+        SaveModelCallback(
+            learner, monitor='dice', name='first_test')])
+```
+
+```{python}
+learner.show_results()
+```
+
+```{python}
+learner.unfreeze()
+```
+
+```{python}
+learner.lr_find(num_it=2000)
+```
+
+```{python}
+learner.recorder.plot(skip_end=1)
+```
+
+```{python}
+learner.fit_one_cycle(
+    10, slice(1e-2),
+    callbacks=[
+        SaveModelCallback(
+            learner, monitor='dice', name='first_test_unfrozen')])
+```
+
+```{python}
+X, y_true = db.train_ds[10]
+```
+
+```{python}
+_, _, y_pred = learner.predict(X)
+```
+
+```{python}
+y_true.show()
+```
+
+```{python}
+db_clf = load_data_classif(LABELS_CLASSIF, bs=BATCH_SIZE, train_size=TRAIN_SIZE, weight_sample=False)
+```
+
+```{python}
+db_clf.show_batch()
+```
+
+```{python}
+clf = cnn_learner(db_clf, models["resnet101"], pretrained=PRETRAINED, loss_func=nn.CrossEntropyLoss(), wd=WD, model_dir=MODELS_PATH, metrics=[accuracy])
+```
+
+```{python}
+clf.unfreeze()
+```
+
+```{python}
+clf.lr_find(num_it=1000)
+```
+
+```{python}
+clf.recorder.plot()
+```
+
+```{python}
+clf.fit_one_cycle(
+    50, slice(1e-3),
+    callbacks=[
+        SaveModelCallback(
+            clf, monitor='accuracy', name='first_test_clf')])
+```
+
+```{python}
+clf.show_results()
+```
+
+```{python}
+interp = clf.interpret()
+```
+
+```{python}
+interp.plot_confusion_matrix()
+```
+
+```{python}
+interp.plot_top_losses(9)
+```
+
+```{python}
+interp.
+```
+
+```{python}
+
+```
