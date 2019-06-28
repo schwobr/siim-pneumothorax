@@ -1,16 +1,16 @@
 import numpy as np
-from tqdm import tqdm
 
 import torch
 
-from fastai.vision.data import SegmentationItemList, SegmentationLabelList, ImageList
-from fastai.data_block import FloatList, FloatItem
-from fastai.vision.image import Image, ImageSegment, image2np, pil2tensor
+from fastai.vision.data import (
+    SegmentationItemList, SegmentationLabelList, ImageList)
+from fastai.vision.image import Image, ImageSegment, pil2tensor
 from fastai.vision.transform import get_transforms
 
 from modules.mask_functions import rle2mask
 from modules.files import open_image
 from modules.samplers import create_sampler
+
 
 class PneumoSegmentationList(SegmentationItemList):
     def open(self, fn):
@@ -76,10 +76,8 @@ def load_data_classif(path, bs=8, train_size=256, weight_sample=True):
                   label_from_df().
                   transform(get_transforms(), size=train_size))
     if weight_sample:
-        #shuffle = False
         sampler = create_sampler(train_list)
     else:
-        #shuffle = True
         sampler = None
     train_list = train_list.databunch(
         bs=bs, num_workers=0, sampler=sampler).normalize()
