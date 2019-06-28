@@ -22,6 +22,7 @@ import pydicom
 import matplotlib.pyplot as plt
 import pandas as pd
 from tqdm import tqdm_notebook as tqdm
+import pdb
 
 from torchvision import transforms
 import torchvision.transforms.functional as TF
@@ -270,9 +271,9 @@ class PneumoClassifList(ImageList):
 
 ```{python}
 class WeightList:
-    def __init__(self, counter=None, classes=[]):
-        assert isinstance(classes, list), "weights and classes must be lists"
-        self._counter = counter if counter is not None else np.zeros(1)
+    def __init__(self, counter, classes=[]):
+        assert isinstance(classes, list), "classes must be lists"
+        self._counter = counter
         self._classes = classes
         
     def __len__(self):
@@ -302,7 +303,7 @@ class WeightList:
 
 ```{python}
 def create_sampler(train_list):
-    weights = WeightList(counter=np.zeros(train_list.c))
+    weights = WeightList(np.zeros(train_list.c), classes=[])
     for _, c in tqdm(train_list.train):
         weights.increment(c.data)
         weights.append(c.data)
@@ -330,12 +331,10 @@ def load_data_classif(path, bs=8, train_size=256, weight_sample=True):
                   label_from_df().
                   transform(get_transforms(), size=train_size))
     if weight_sample:
-        #shuffle = False
         sampler = create_sampler(train_list)
-    else:
-        #shuffle = True
-        sampler = None
-    train_list = train_list.databunch(bs=bs, num_workers=0, sampler=sampler).normalize()
+    train_list = train_list.databunch(bs=bs, num_workers=0).normalize()
+    if weight_sample:
+        train_list.train_dl = train_list.train_dl.new(shuffle=False, sampler=sampler)
     return train_list
 ```
 
@@ -449,11 +448,11 @@ y_true.show()
 ```
 
 ```{python}
-db_clf = load_data_classif(LABELS_CLASSIF, bs=BATCH_SIZE, train_size=TRAIN_SIZE, weight_sample=False)
+db_clf = load_data_classif(LABELS_CLASSIF, bs=BATCH_SIZE, train_size=TRAIN_SIZE, weight_sample=True)
 ```
 
 ```{python}
-db_clf.show_batch()
+db_clf.show_batch(cmap=plt.cm.bone)
 ```
 
 ```{python}
@@ -497,7 +496,15 @@ interp.plot_top_losses(9)
 ```
 
 ```{python}
-interp.
+import matplotlib.pyplot as plt
+```
+
+```{python}
+plt.cm.bone
+```
+
+```{python}
+
 ```
 
 ```{python}
