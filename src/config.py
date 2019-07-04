@@ -9,27 +9,31 @@ IMG_CHANNELS = 3
 
 # PATHS
 PROJECT_PATH = Path(
-    '/home/robin/siim-pneumothorax')
+    '/work/stages/schwob/siim-pneumothorax')
 FULL_TRAIN_PATH = PROJECT_PATH/'data/dicom-images-train'
 FULL_TEST_PATH = PROJECT_PATH/'data/dicom-images-test'
+DATA = PROJECT_PATH/'data'
 TRAIN_PATH = PROJECT_PATH/'data/train'
 TEST_PATH = PROJECT_PATH/'data/test'
 MODELS_PATH = PROJECT_PATH/'models/'
+STATE_DICT_PATH = MODELS_PATH/'resnet152_backbone_pretrained.pth'
 SUB_PATH = PROJECT_PATH/'submissions/'
 LABELS_OLD = PROJECT_PATH/'data/train-rle.csv'
-LABELS = PROJECT_PATH/'data/train-rle-fastai1.csv'
+LABELS = PROJECT_PATH/'data/train-rle-fastai2.csv'
+LABELS_POS = PROJECT_PATH/'data/train-rle-fastai_pos.csv'
 LABELS_CLASSIF = PROJECT_PATH/'data/train-rle-fastai-classif.csv'
 LOG = Path('/work/stages/schwob/runs')
 
 # LEARNER CONFIG
 BATCH_SIZE = 4
 WD = 0.1
-LR = 1e-2
+LR = 2e-4
+LR_CLF = 1e-4
 GROUP_LIMITS = None
 FREEZE_UNTIL = None
-EPOCHS = 10
+EPOCHS = 50
 UNFROZE_EPOCHS = 10
 PRETRAINED = True
-MODEL = 'resnet152'
+MODEL = 'resnet101'
 CLASSES = ['pneum']
 ACT = 'sigmoid'
