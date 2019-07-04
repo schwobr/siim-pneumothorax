@@ -1,7 +1,7 @@
 import os
 import config as cfg
 from modules.files import (change_csv, merge_doubles,
-                           create_classif_csv, restruct)
+                           create_classif_csv, restruct, keep_pos)
 
 
 def run():
@@ -19,3 +19,6 @@ def run():
 
     if not cfg.LABELS_CLASSIF.is_file():
         create_classif_csv(cfg.LABELS, cfg.LABELS_CLASSIF)
+
+    if not cfg.LABELS_POS.is_file():
+        keep_pos(cfg.LABELS, cfg.LABELS_POS)
