@@ -640,30 +640,27 @@ preds = torch.sigmoid(preds)
 ```
 
 ```{python}
-
-```
-
-```{python}
 valid_preds, valid_gt = learner.get_preds(DatasetType.Valid)
-thrs = np.arange(0.01, 1, 0.01)
 ```
 
 ```{python}
-dices = []
-for i in thrs:
-    dices.append(dice(preds_m, valid_gt, thr=i).item())
-dices = np.array(dices)
-```
-
-```{python}
-best_dice = dices.max()
-best_thr = thrs[dices.argmax()]
-
-plt.figure(figsize=(8,4))
-plt.plot(thrs, dices)
-plt.vlines(x=best_thr, ymin=dices.min(), ymax=dices.max())
-plt.text(best_thr+0.03, best_dice-0.01, f'DICE = {best_dice:.3f}', fontsize=14);
-plt.show()
+def get_best_thr(preds, gt, plot=True):
+    thrs = np.arange(0.01, 1, 0.01)
+    dices = []
+    for i in tqdm(thrs):
+        dices.append(dice(preds_m, valid_gt, thr=i).item())
+    dices = np.array(dices)
+    best_dice = dices.max()
+    best_thr = thrs[dices.argmax()]
+    
+    if plot:
+        plt.figure(figsize=(8,4))
+        plt.plot(thrs, dices)
+        plt.vlines(x=best_thr, ymin=dices.min(), ymax=dices.max())
+        plt.text(best_thr+0.03, best_dice-0.01, f'DICE = {best_dice:.3f}', fontsize=14);
+        plt.show()
+    
+    return best_thr
 ```
 
 ```{python}
