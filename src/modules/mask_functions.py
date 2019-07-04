@@ -44,3 +44,71 @@ def rle2mask(rle, width, height):
         current_position += lengths[index]
 
     return mask.reshape(width, height).T
+
+
+def absol2relat(rle):
+    if rle == '-1':
+        return '-1'
+    pixels = rle.split()
+    new_rle = []
+    cur = 0
+    for k in range(0, len(pixels), 2):
+        if k == 0:
+            new_rle.append(pixels[k])
+            new_rle.append(pixels[k+1])
+        else:
+            cur = int(pixels[k])
+            prev = int(pixels[k-2])+int(pixels[k-1])
+            new_rle.append(str(cur-prev))
+            new_rle.append(pixels[k+1])
+    return ' '.join(new_rle)
+
+
+def relat2absol(rle):
+    if rle == '-1':
+        return '-1'
+    pixels = rle.split()
+    new_rle = []
+    cur = 0
+    for k in range(0, len(pixels), 2):
+        pix = pixels[k]
+        cur += int(pix)
+        length = pixels[k+1]
+        new_rle.append(str(cur))
+        new_rle.append(length)
+        cur += int(length)
+    return ' '.join(new_rle)
+
+
+def merge_rles(rle1, rle2):
+    if rle1 == rle2:
+        return rle1
+    i1 = 0
+    i2 = 0
+    rle = []
+    pixels1 = relat2absol(rle1).split()
+    pixels2 = relat2absol(rle2).split()
+    while i1 < len(pixels1) and i2 < len(pixels2):
+        p1 = int(pixels1[i1])
+        l1 = int(pixels1[i1+1])
+        p2 = int(pixels2[i2])
+        l2 = int(pixels2[i2+1])
+        if p1 <= p2:
+            rle.append(str(p1))
+            if p2 <= p1+l1-1:
+                rle.append(str(max(p2-p1+l2, l1)))
+                i2 += 2
+            else:
+                rle.append(str(l1))
+            i1 += 2
+        else:
+            rle.append(str(p2))
+            if p1 <= p2+l2-1:
+                rle.append(str(max(p1-p2+l1, l2)))
+                i1 += 2
+            else:
+                rle.append(str(l2))
+            i2 += 2
+
+    rle += pixels1[i1:]+pixels2[i2:]
+    return absol2relat(' '.join(rle))

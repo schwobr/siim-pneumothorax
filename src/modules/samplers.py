@@ -1,44 +1,29 @@
-import numpy as np
-from tqdm import tqdm
-from torch.utils.data import WeightedRandomSampler
+import torch
+from torch.utils.data import Sampler
 
 
-class WeightList:
-    def __init__(self, counter, classes=[]):
-        assert isinstance(classes, list), "classes must be lists"
-        self._counter = counter
-        self._classes = classes
+class RandomSampler(Sampler):
+    def __init__(self, model, loss, dl, num_samples, bs):
+        assert loss.reduction == 'none', 'Loss function must disable reduction'
+        self.model = model
+        self.bs = bs
+        self.dl = dl.new(shuffle=False, sampler=None)
+        self.loss = loss
+        self.num_samples = num_samples
 
-    def __len__(self):
-        return len(self._classes)
-
-    def __getitem__(self, key):
-        return self._counter[self._classes[key]]
+    def get_scores(self):
+        losses = []
+        with torch.no_grad():
+            for X, y_true in self.dl:
+                y_pred = self.model(X)
+                loss = self.loss(y_pred, y_true)
+                losses.append(loss)
+        return torch.cat(losses)
 
     def __iter__(self):
-        return iter([self._counter[c] for c in self._classes])
+        scores = self.get_scores()
+        return iter(
+            torch.multinomial(scores, self.num_samples, True).tolist())
 
-    def append(self, c):
-        self._classes.append(c)
-
-    def pop(self, key):
-        self._classes.pop(key)
-
-    def increment(self, c):
-        self._counter[c] += 1
-
-    def inverse(self):
-        self._counter = 1/self._counter
-
-    def tolist(self):
-        return [self._counter[c] for c in self._classes]
-
-
-def create_sampler(train_list):
-    weights = WeightList(np.zeros(train_list.c), classes=[])
-    for _, c in tqdm(train_list.train):
-        weights.increment(c.data)
-        weights.append(c.data)
-    weights.inverse()
-    sampler = WeightedRandomSampler(weights.tolist(), len(weights))
-    return sampler
+    def __len__(self):
+        return self.num_samples
