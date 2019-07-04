@@ -1,6 +1,7 @@
 import numpy as np
 
 import torch
+from torch.utils.data import WeightedRandomSampler
 
 from fastai.vision.data import (
     SegmentationItemList, SegmentationLabelList, ImageList)
@@ -9,7 +10,6 @@ from fastai.vision.transform import get_transforms
 
 from modules.mask_functions import rle2mask
 from modules.files import open_image
-from modules.samplers import create_sampler
 
 
 class PneumoSegmentationList(SegmentationItemList):
@@ -55,6 +55,20 @@ class PneumoClassifList(ImageList):
         return Image(x/255)
 
 
+def get_weights(train_list):
+    df = train_list.inner_df
+    n_tot = df.shape[0]
+    df = df.reindex(index=range(n_tot), method='bfill')
+    class_weights = []
+    weights = np.zeros(n_tot)
+    for c in train_list.classes:
+        w = df.loc[df['Labels'] == c].shape[0]/n_tot
+        w = (1-w)/(train_list.c-1)
+        class_weights.append(w)
+        weights[df.loc[df['Labels'] == c].index.values] = w
+    return weights, class_weights
+
+
 def load_data(path, bs=8, train_size=256):
     train_list = (
         PneumoSegmentationList.
@@ -65,7 +79,7 @@ def load_data(path, bs=8, train_size=256):
             label_cls=MaskList, train_path=path.parent).transform(
             get_transforms(),
             size=train_size, tfm_y=True).databunch(
-            bs=bs, num_workers=0))
+            bs=bs, num_workers=0).normalize())
     return train_list
 
 
@@ -76,9 +90,14 @@ def load_data_classif(path, bs=8, train_size=256, weight_sample=True):
                   label_from_df().
                   transform(get_transforms(), size=train_size))
     if weight_sample:
-        sampler = create_sampler(train_list)
-    else:
-        sampler = None
-    train_list = train_list.databunch(
-        bs=bs, num_workers=0, sampler=sampler).normalize()
-    return train_list
+        weights, class_weights = get_weights(train_list)
+        sampler = WeightedRandomSampler(weights, len(weights))
+
+    train_list = train_list.databunch(bs=bs, num_workers=0).normalize()
+
+    if weight_sample:
+        train_list.train_dl = train_list.train_dl.new(
+            shuffle=False, sampler=sampler)
+        return train_list, class_weights
+
+    return train_list, None
