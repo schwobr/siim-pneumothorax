@@ -24,15 +24,18 @@ import pandas as pd
 from tqdm import tqdm_notebook as tqdm
 import pdb
 
+from skimage.morphology import label
+
 from torchvision import transforms
 import torchvision.transforms.functional as TF
 from torch.nn.functional import binary_cross_entropy_with_logits
 import torch
 import torch.nn as nn
-from torch.utils.data import WeightedRandomSampler
+from torch.utils.data import WeightedRandomSampler, Sampler
 
 from fastai.vision.data import SegmentationItemList, SegmentationLabelList, ImageList
 from fastai.data_block import FloatList, FloatItem
+from fastai.basic_data import DatasetType
 from fastai.vision.image import Image, ImageSegment, image2np, pil2tensor
 from fastai.vision.transform import get_transforms
 from fastai.vision.learner import unet_learner, cnn_learner
@@ -54,25 +57,28 @@ PROJECT_PATH = Path(
     '/work/stages/schwob/siim-pneumothorax')
 FULL_TRAIN_PATH = PROJECT_PATH/'data/dicom-images-train'
 FULL_TEST_PATH = PROJECT_PATH/'data/dicom-images-test'
+DATA = PROJECT_PATH/'data'
 TRAIN_PATH = PROJECT_PATH/'data/train'
 TEST_PATH = PROJECT_PATH/'data/test'
 MODELS_PATH = PROJECT_PATH/'models/'
+STATE_DICT_PATH = MODELS_PATH/'resnet152_backbone_pretrained.pth'
 SUB_PATH = PROJECT_PATH/'submissions/'
 LABELS_OLD = PROJECT_PATH/'data/train-rle.csv'
-LABELS = PROJECT_PATH/'data/train-rle-fastai1.csv'
+LABELS = PROJECT_PATH/'data/train-rle-fastai2.csv'
+LABELS_POS = PROJECT_PATH/'data/train-rle-fastai_pos.csv'
 LABELS_CLASSIF = PROJECT_PATH/'data/train-rle-fastai-classif.csv'
 LOG = Path('/work/stages/schwob/runs')
 
 # LEARNER CONFIG
 BATCH_SIZE = 4
 WD = 0.1
-LR = 1e-2
+LR = 2e-4
 GROUP_LIMITS = None
 FREEZE_UNTIL = None
 EPOCHS = 10
 UNFROZE_EPOCHS = 10
 PRETRAINED = True
-MODEL = 'resnet34'
+MODEL = 'resnet152'
 CLASSES = ['pneum']
 ACT = 'sigmoid'
 ```
@@ -80,7 +86,7 @@ ACT = 'sigmoid'
 ```{python}
 models = {
     'resnet34': mod.resnet34, 'resnet50': mod.resnet50,
-    'resnet101': mod.resnet101, 'resnet125': mod.resnet152}
+    'resnet101': mod.resnet101, 'resnet152': mod.resnet152}
 ```
 
 ```{python}
@@ -128,15 +134,105 @@ df['ImageId'].unique().shape
 ```
 
 ```{python}
+def absol2relat(rle):
+    if rle == '-1': return '-1'
+    pixels = rle.split()
+    new_rle = []
+    cur = 0
+    for k in range(0, len(pixels), 2):
+        if k==0:
+            new_rle.append(pixels[k])
+            new_rle.append(pixels[k+1])
+        else:
+            cur = int(pixels[k])
+            prev = int(pixels[k-2])+int(pixels[k-1])
+            new_rle.append(str(cur-prev))
+            new_rle.append(pixels[k+1])
+    return ' '.join(new_rle)
+```
+
+```{python}
+def relat2absol(rle):
+    if rle == '-1': return '-1'
+    pixels = rle.split()
+    new_rle = []
+    cur = 0
+    for k in range(0, len(pixels), 2):
+        pix = pixels[k]
+        cur += int(pix)
+        length = pixels[k+1]
+        new_rle.append(str(cur))
+        new_rle.append(length)
+        cur += int(length)
+    return ' '.join(new_rle)
+```
+
+```{python}
+def merge_rles(rle1, rle2):
+    if rle1 == rle2: return rle1
+    i1 = 0
+    i2 = 0
+    rle = []
+    pixels1 = relat2absol(rle1).split()
+    pixels2 = relat2absol(rle2).split()
+    while i1<len(pixels1) and i2<len(pixels2):
+        p1 = int(pixels1[i1])
+        l1 = int(pixels1[i1+1])
+        p2 = int(pixels2[i2])
+        l2 = int(pixels2[i2+1])
+        if p1<=p2: 
+            rle.append(str(p1))
+            if p2<=p1+l1-1:
+                rle.append(str(max(p2-p1+l2, l1)))
+                i2 += 2
+            else:
+                rle.append(str(l1))
+            i1 += 2
+        else: 
+            rle.append(str(p2))
+            if p1<=p2+l2-1:
+                rle.append(str(max(p1-p2+l1, l2)))
+                i1 += 2
+            else:
+                rle.append(str(l2))
+            i2 += 2
+            
+    rle += pixels1[i1:]+pixels2[i2:]
+    return absol2relat(' '.join(rle))
+```
+
+```{python}
 def merge_doubles(old, new):
     df = pd.read_csv(old)
     new_df = pd.DataFrame(columns=['ImageId', 'EncodedPixels'])
     for k, id in enumerate(df['ImageId'].unique()):
-        rles = []
+        new_rle = ''
         for rle in df.loc[df['ImageId']==id, 'EncodedPixels']:
-            rles.append(rle)
-        new_df.loc[k] = [id, ' '.join(rles)]
+            new_rle = merge_rles(new_rle, rle)
+        new_df.loc[k] = [id, new_rle]
     new_df.to_csv(new, index=False)
+```
+
+```{python}
+#merge_doubles(PROJECT_PATH/'data/train-rle-fastai.csv', PROJECT_PATH/'data/train-rle-fastai2.csv')
+```
+
+```{python}
+def keep_pos(old, new):
+    df = pd.read_csv(old)
+    new_df = pd.DataFrame(columns=['ImageId', 'EncodedPixels'])
+    for row in df.itertuples():
+        id = row.ImageId
+        rle = row.EncodedPixels
+        k = row.Index
+        if rle != '-1' or random.random() <= 0.1:
+            # keep all postive and only 10% of negative for segmentation
+            new_df.loc[k] = [id, rle]
+    new_df.to_csv(new, index=False)
+```
+
+```{python}
+#keep_pos(LABELS, LABELS_POS)
 ```
 
 ```{python}
@@ -166,9 +262,39 @@ def show(img, figsize=(10, 10)):
 ```
 
 ```{python}
+def show_dcm_info(fn):
+    dataset = pydicom.dcmread(str(fn))
+    print("Filename.........:", fn)
+    print("Storage type.....:", dataset.SOPClassUID)
+    print()
+
+    pat_name = dataset.PatientName
+    display_name = pat_name.family_name + ", " + pat_name.given_name
+    print("Patient's name......:", display_name)
+    print("Patient id..........:", dataset.PatientID)
+    print("Patient's Age.......:", dataset.PatientAge)
+    print("Patient's Sex.......:", dataset.PatientSex)
+    print("Modality............:", dataset.Modality)
+    print("Body Part Examined..:", dataset.BodyPartExamined)
+    print("View Position.......:", dataset.ViewPosition)
+    
+    if 'PixelData' in dataset:
+        rows = int(dataset.Rows)
+        cols = int(dataset.Columns)
+        print("Image size.......: {rows:d} x {cols:d}, {size:d} bytes".format(
+            rows=rows, cols=cols, size=len(dataset.PixelData)))
+        if 'PixelSpacing' in dataset:
+            print("Pixel spacing....:", dataset.PixelSpacing)
+```
+
+```{python}
 fn = next(TRAIN_PATH.glob('**/*.dcm'))
 img = open_image(fn)
 show(img)
+```
+
+```{python}
+show_dcm_info(fn)
 ```
 
 ```{python}
@@ -270,6 +396,21 @@ class PneumoClassifList(ImageList):
 ```
 
 ```{python}
+def get_weights(train_list):
+    df = train_list.inner_df
+    n_tot = df.shape[0]
+    df = df.reindex(index=range(n_tot), method='bfill')
+    class_weights = []
+    weights = np.zeros(n_tot)    
+    for c in train_list.classes:
+        w = df.loc[df['Labels']==c].shape[0]/n_tot
+        w = (1-w)/(train_list.c-1)
+        class_weights.append(w)
+        weights[df.loc[df['Labels']==c].index.values] = w
+    return weights, class_weights
+```
+
+```{python}
 class WeightList:
     def __init__(self, counter, classes=[]):
         assert isinstance(classes, list), "classes must be lists"
@@ -302,13 +443,9 @@ class WeightList:
 ```
 
 ```{python}
-def create_sampler(train_list):
-    weights = WeightList(np.zeros(train_list.c), classes=[])
-    for _, c in tqdm(train_list.train):
-        weights.increment(c.data)
-        weights.append(c.data)
-    weights.inverse()
-    sampler = WeightedRandomSampler(weights.tolist(), len(weights))
+def create_sampler(train_list, class_weights):
+    weights = [class_weights[c.data] for _, c in train_list.train]
+    sampler = WeightedRandomSampler(weights, len(weights))
     return sampler
 ```
 
@@ -319,7 +456,8 @@ def load_data(path, bs=8, train_size=256):
                   split_by_rand_pct(valid_pct=0.2).
                   label_from_df(cols=[0, 1], classes=['pneum'], label_cls=MaskList, train_path=path.parent).
                   transform(get_transforms(), size=train_size, tfm_y=True).
-                  databunch(bs=bs, num_workers=0))
+                  databunch(bs=bs, num_workers=0).
+                  normalize())
     return train_list
 ```
 
@@ -331,72 +469,120 @@ def load_data_classif(path, bs=8, train_size=256, weight_sample=True):
                   label_from_df().
                   transform(get_transforms(), size=train_size))
     if weight_sample:
-        sampler = create_sampler(train_list)
+        weights, class_weights = get_weights(train_list)
+        sampler = WeightedRandomSampler(weights, len(weights))
+        
     train_list = train_list.databunch(bs=bs, num_workers=0).normalize()
+    
     if weight_sample:
         train_list.train_dl = train_list.train_dl.new(shuffle=False, sampler=sampler)
-    return train_list
-```
-
-```{python}
-db = load_data(LABELS, bs=BATCH_SIZE, train_size=TRAIN_SIZE)
-```
-
-```{python}
-db.train_ds[0][1].px
-```
-
-```{python}
-db.show_batch(cmap=plt.cm.bone)
-```
-
-```{python}
-def dice(input, target, smooth=1.):
-    iflat = torch.sigmoid(input).view(-1)
-    tflat = target.view(-1)
-    intersection = (iflat * tflat).sum()
+        return train_list, class_weights
     
-    return (2. * intersection + smooth)/(iflat.sum() + tflat.sum() + smooth)
+    return train_list, None
 ```
 
 ```{python}
-def dice_loss(input, target, smooth=1e-2):
-    return 1-dice(input, target, smooth=smooth)
+db = load_data(LABELS_POS, bs=BATCH_SIZE, train_size=TRAIN_SIZE)
 ```
 
 ```{python}
-def bce_dice_loss(input, target, a=0.5, b=0.5, smooth=1.):
-    return a*dice_loss(input, target, smooth=smooth)+b*binary_cross_entropy_with_logits(input, target)
+db.show_batch(rows=3, cmap=plt.cm.bone)
+```
+
+```{python}
+def dice(input, target, thr=None, smooth=1., reduction='mean'):
+    assert input.shape==target.shape, "input and target must have same shape"
+    iflat = torch.sigmoid(input).view(input.size(0), -1)
+    if thr: iflat = (iflat>thr).float()
+    tflat = target.view(target.size(0), -1)
+    
+    intersection = (iflat * tflat).sum(-1)
+    dice = (2. * intersection + smooth)/(iflat.sum(-1) + tflat.sum(-1) + smooth)
+    
+    if reduction=='mean':
+        return dice.mean()
+    elif reduction=='sum':
+        return dice.sum()
+    else:
+        return dice
+```
+
+```{python}
+def dice_loss(input, target, smooth=1e-2, **kwargs):
+    return 1-dice(input, target, smooth=smooth, **kwargs)
+```
+
+```{python}
+def bce_dice_loss(input, target, a=0.5, b=0.5, smooth=1., weights=None, **kwargs):
+    return a*dice_loss(input, target, smooth=smooth, **kwargs)+b*binary_cross_entropy_with_logits(input, target, pos_weight=weights, **kwargs)
 ```
 
 ```{python}
 class DiceLoss(nn.Module):
-    def __init__(self, smooth=1.):
+    def __init__(self, smooth=1., reduction='mean'):
         super().__init__()
         self.smooth = smooth
+        self.reduction = reduction
     
     def forward(self, input, target):
-        return dice_loss(input, target, smooth=self.smooth)
+        return dice_loss(input, target, smooth=self.smooth, reduction=self.reduction)
 ```
 
 ```{python}
 class BCEDiceLoss(nn.Module):
-    def __init__(self, a=0.5, b=0.5, smooth=1.):
+    def __init__(self, a=0.5, b=0.5, smooth=1., weights=None, reduction='mean'):
         super().__init__()
         self.a = a
         self.b = b
         self.smooth = smooth
+        self.weights = weights
+        self.reduction = reduction
         
-    def forward(self, input, target):
-        return bce_dice_loss(input, target, a=self.a, b=self.b, smooth=self.smooth)
+    def forward(self, input, target, **kwargs):
+        return bce_dice_loss(input, target, a=self.a, b=self.b, smooth=self.smooth, weights=self.weights, reduction=self.reduction)
 ```
 
 ```{python}
-learner = unet_learner(db, models[MODEL], pretrained=PRETRAINED, loss_func=DiceLoss(), wd=WD, model_dir=MODELS_PATH, metrics=[dice])
+class RandomSampler(Sampler):
+    def __init__(self, model, loss, dl, num_samples, bs):
+        assert loss.reduction=='none', 'Loss function must disable reduction'
+        self.model = model
+        self.bs = bs
+        self.dl = dl.new(shuffle=False, sampler=None)
+        self.loss = loss
+        self.num_samples = num_samples
+
+    def get_scores(self):
+        losses = []
+        with torch.no_grad():
+            for X, y_true in self.dl:
+                y_pred = self.model(X)
+                loss = self.loss(y_pred, y_true)
+                losses.append(loss)
+        return torch.cat(losses)
+
+    def __iter__(self):
+        scores = self.get_scores()
+        return iter(torch.multinomial(scores, self.num_samples, True).tolist())
+
+    def __len__(self):
+        return self.num_samples
 ```
 
 ```{python}
-learner.lr_find(num_it=2000)
+learner = unet_learner(db, models[MODEL], pretrained=PRETRAINED, loss_func=BCEDiceLoss(a=0.8, b=0.2), wd=WD, model_dir=MODELS_PATH, metrics=[dice])
+```
+
+```{python}
+next(learner.model.children())[0].load_state_dict(torch.load(STATE_DICT_PATH))
+```
+
+```{python}
+learner.to_fp16()
+```
+
+```{python}
+learner.lr_find()
 ```
 
 ```{python}
@@ -408,7 +594,7 @@ learner.fit_one_cycle(
     10, slice(LR),
     callbacks=[
         SaveModelCallback(
-            learner, monitor='dice', name='first_test')])
+            learner, monitor='dice', name='seg_resnet152_0')])
 ```
 
 ```{python}
@@ -436,19 +622,88 @@ learner.fit_one_cycle(
 ```
 
 ```{python}
-X, y_true = db.train_ds[10]
+test_list = (PneumoSegmentationList.
+             from_folder(TEST_PATH, extensions=['.dcm']))
+db.add_test(test_list, tfms=(), tfm_y=False)
 ```
 
 ```{python}
-_, _, y_pred = learner.predict(X)
+preds = learner.get_preds(DatasetType.Test)
 ```
 
 ```{python}
-y_true.show()
+preds = preds[0]
 ```
 
 ```{python}
-db_clf = load_data_classif(LABELS_CLASSIF, bs=BATCH_SIZE, train_size=TRAIN_SIZE, weight_sample=True)
+preds = torch.sigmoid(preds)
+```
+
+```{python}
+
+```
+
+```{python}
+valid_preds, valid_gt = learner.get_preds(DatasetType.Valid)
+thrs = np.arange(0.01, 1, 0.01)
+```
+
+```{python}
+dices = []
+for i in thrs:
+    dices.append(dice(preds_m, valid_gt, thr=i).item())
+dices = np.array(dices)
+```
+
+```{python}
+best_dice = dices.max()
+best_thr = thrs[dices.argmax()]
+
+plt.figure(figsize=(8,4))
+plt.plot(thrs, dices)
+plt.vlines(x=best_thr, ymin=dices.min(), ymax=dices.max())
+plt.text(best_thr+0.03, best_dice-0.01, f'DICE = {best_dice:.3f}', fontsize=14);
+plt.show()
+```
+
+```{python}
+def create_submission(preds, path, thr=0.5):
+    sub = pd.DataFrame(columns=['ImageId', 'EncodedPixels'])
+    index = 0
+    for k, pred in tqdm(enumerate(preds.squeeze()), total=preds.size(0)):
+        y = pred.numpy()
+        y = cv2.resize(y, (1024, 1024), interpolation=cv2.INTER_CUBIC)
+        labels = label(y>thr)
+        id = db.test_ds.items[k].with_suffix('').name
+        if labels.max() == 0:
+            sub.loc[index] = [id, '-1']
+            index += 1
+        for i in range(1, labels.max()+1):
+            mask = (labels==i).astype(np.uint8)*255
+            rle = mask2rle(mask.T, 1024, 1024)
+            sub.loc[index] = [id, rle]
+            index += 1
+    sub.to_csv(path, index=False)
+    return sub
+```
+
+```{python}
+db_clf, class_weights = load_data_classif(LABELS_CLASSIF, bs=BATCH_SIZE, train_size=TRAIN_SIZE, weight_sample=True)
+```
+
+```{python}
+clf = cnn_learner(db_clf, models['resnet152'], pretrained=PRETRAINED,
+                  loss_func=nn.CrossEntropyLoss(weight=torch.tensor(class_weights, device=db_clf.device)),
+                  wd=WD, model_dir=MODELS_PATH, metrics=[accuracy])
+```
+
+```{python}
+loss =  nn.CrossEntropyLoss(weight=torch.tensor(class_weights, device=db_clf.device), reduction='none')
+sampler = RandomSampler(clf.model, loss, db_clf.train_dl, len(db_clf.train_ds), db_clf.batch_size)
+```
+
+```{python}
+clf.data.train_dl = db_clf.train_dl.new(shuffle=False, sampler=sampler)
 ```
 
 ```{python}
@@ -456,15 +711,15 @@ db_clf.show_batch(cmap=plt.cm.bone)
 ```
 
 ```{python}
-clf = cnn_learner(db_clf, models["resnet101"], pretrained=PRETRAINED, loss_func=nn.CrossEntropyLoss(), wd=WD, model_dir=MODELS_PATH, metrics=[accuracy])
-```
-
-```{python}
 clf.unfreeze()
 ```
 
 ```{python}
-clf.lr_find(num_it=1000)
+clf.load('clf_resnet152_0').to_fp16()
+```
+
+```{python}
+clf.lr_find(num_it=500)
 ```
 
 ```{python}
@@ -473,10 +728,18 @@ clf.recorder.plot()
 
 ```{python}
 clf.fit_one_cycle(
-    50, slice(1e-3),
+    50, slice(3e-5),
     callbacks=[
         SaveModelCallback(
-            clf, monitor='accuracy', name='first_test_clf')])
+            clf, monitor='accuracy', name='clf_resnet152_2')])
+```
+
+```{python}
+clf.recorder.plot_losses()
+```
+
+```{python}
+clf.recorder.plot_metrics()
 ```
 
 ```{python}
@@ -492,19 +755,99 @@ interp.plot_confusion_matrix()
 ```
 
 ```{python}
-interp.plot_top_losses(9)
+interp.plot_top_losses(9, heatmap=False)
 ```
 
 ```{python}
-import matplotlib.pyplot as plt
+df = pd.read_csv(LABELS_CLASSIF)
+stats = pd.DataFrame(columns=['ImageId', 'Age', 'Sex', 'Height', 'Width', 'Pneumo'])
+for row in tqdm(df.itertuples(), total=df.shape[0]):
+    fn = row.ImageId
+    ds = pydicom.dcmread(str(DATA/fn))
+    h, w = ds.pixel_array.shape
+    stats.loc[row.Index] = [row.ImageId, int(ds.PatientAge), ds.PatientSex, h, w, int(row.Labels)]
 ```
 
 ```{python}
-plt.cm.bone
+stats.head()
 ```
 
 ```{python}
+stats.loc[stats['Sex']=='F'].shape[0]
+```
 
+```{python}
+stats.loc[stats['Sex']=='M'].shape[0]
+```
+
+```{python}
+stats_age = stats.groupby(pd.cut(stats['Age'], list(range(0, 101, 10))+[450]))
+```
+
+```{python}
+stats_age.count()['Pneumo']
+```
+
+```{python}
+stats_age.sum()['Pneumo']/stats_age.count()['Pneumo']
+```
+
+```{python}
+stats_sex = stats.groupby('Sex')
+```
+
+```{python}
+stats_sex.count()['Pneumo']
+```
+
+```{python}
+stats_sex.sum()['Pneumo']/stats_sex.count()['Pneumo']
+```
+
+```{python}
+losses, idxs = interp.top_losses()
+```
+
+```{python}
+idxs = idxs.numpy()
+```
+
+```{python}
+ids = []
+for i, l in zip(idxs, losses):
+    if l.item()<0.2:
+        break
+    id = Path(interp.ds.items[i])
+    id = Path(id.parent.name)/id.name
+    ids.append(str(id))
+```
+
+```{python}
+top_losses = stats.loc[stats['ImageId'].isin(ids)]
+```
+
+```{python}
+top_losses.head()
+```
+
+```{python}
+top_losses.groupby('Pneumo').count().head()['ImageId']
+```
+
+```{python}
+top_losses.groupby('Sex').count().head()['ImageId']/stats_sex.count()['Pneumo']
+```
+
+```{python}
+top_losses.groupby(pd.cut(top_losses['Age'], list(range(0, 101, 10))+[450])).count().head()['ImageId']/stats_age.count()['Pneumo']
+```
+
+```{python}
+torch.save(next(clf.model.children()).state_dict(), MODELS_PATH/'resnet152_backbone_pretrained.pth')
+```
+
+```{python}
+clf.destroy()
 ```
 
 ```{python}
