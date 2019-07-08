@@ -23,6 +23,7 @@ LABELS = PROJECT_PATH/'data/train-rle-fastai2.csv'
 LABELS_POS = PROJECT_PATH/'data/train-rle-fastai_pos.csv'
 LABELS_CLASSIF = PROJECT_PATH/'data/train-rle-fastai-classif.csv'
 LOG = Path('/work/stages/schwob/runs')
+FIGS_PATH = PROJECT_PATH/'figures'
 
 # LEARNER CONFIG
 BATCH_SIZE = 4

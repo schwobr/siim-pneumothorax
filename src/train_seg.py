@@ -41,6 +41,12 @@ def run():
             SaveModelCallback(
                 learner, monitor='dice', name=save_name)])
 
+    fig = learner.recorder.plot_losses(return_fig=True)
+    fig.save_fig(cfg.FIGS_PATH/f'loss_frozen_{save_name}.png')
+
+    fig = learner.recorder.plot_metrics(return_fig=True)
+    fig.save_fig(cfg.FIGS_PATH/f'dice_frozen_{save_name}.png')
+
     learner.unfreeze()
 
     learner.fit_one_cycle(
@@ -48,5 +54,11 @@ def run():
         callbacks=[
             SaveModelCallback(
                 learner, monitor='dice', name=save_name)])
+
+    fig = learner.recorder.plot_losses(return_fig=True)
+    fig.save_fig(cfg.FIGS_PATH/f'loss_unfrozen_{save_name}.png')
+
+    fig = learner.recorder.plot_metrics(return_fig=True)
+    fig.save_fig(cfg.FIGS_PATH/f'dice_unfrozen_{save_name}.png')
 
     learner.destroy()
