@@ -26,15 +26,15 @@ LOG = Path('/work/stages/schwob/runs')
 FIGS_PATH = PROJECT_PATH/'figures'
 
 # LEARNER CONFIG
-BATCH_SIZE = 4
-WD = 0.2
-LR = 2e-4
-LR_CLF = 1e-4
+BATCH_SIZE = 16
+WD = 0.1
+LR = 1e-3
+LR_CLF = 2e-3
 GROUP_LIMITS = None
 FREEZE_UNTIL = None
-EPOCHS = 10
-UNFROZE_EPOCHS = 100
+EPOCHS = 20
+UNFROZE_EPOCHS = 10
 PRETRAINED = True
-MODEL = 'resnet101'
+MODEL = 'resnet34'
 CLASSES = ['pneum']
 ACT = 'sigmoid'

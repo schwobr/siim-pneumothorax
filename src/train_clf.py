@@ -38,24 +38,24 @@ def run():
                 clf, monitor='accuracy', name=save_name)])
 
     fig = clf.recorder.plot_losses(return_fig=True)
-    fig.save_fig(cfg.FIGS_PATH/f'loss_frozen_{save_name}.png')
+    fig.savefig(cfg.FIGS_PATH/f'loss_frozen_{save_name}.png')
 
     fig = clf.recorder.plot_metrics(return_fig=True)
-    fig.save_fig(cfg.FIGS_PATH/f'acc_frozen_{save_name}.png')
+    fig.savefig(cfg.FIGS_PATH/f'acc_frozen_{save_name}.png')
 
     clf.unfreeze()
 
     clf.fit_one_cycle(
-        cfg.UNFROZE_EPOCHS, slice(cfg.LR_CLF/50, cfg.LR_CLF),
+        cfg.UNFROZE_EPOCHS, slice(cfg.LR_CLF/100, cfg.LR_CLF/5),
         callbacks=[
             SaveModelCallback(
                 clf, monitor='accuracy', name=save_name)])
 
     fig = clf.recorder.plot_losses(return_fig=True)
-    fig.save_fig(cfg.FIGS_PATH/f'loss_unfrozen_{save_name}.png')
+    fig.savefig(cfg.FIGS_PATH/f'loss_unfrozen_{save_name}.png')
 
     fig = clf.recorder.plot_metrics(return_fig=True)
-    fig.save_fig(cfg.FIGS_PATH/f'acc_unfrozen_{save_name}.png')
+    fig.savefig(cfg.FIGS_PATH/f'acc_unfrozen_{save_name}.png')
 
     torch.save(next(clf.model.children()).state_dict(),
                cfg.MODELS_PATH/f'backbone_{save_name}.pth')
