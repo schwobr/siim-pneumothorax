@@ -41,8 +41,8 @@ def keep_pos(old, new):
         id = row.ImageId
         rle = row.EncodedPixels
         k = row.Index
-        if rle != '-1' or random.random() <= 0.1:
-            # keep all postive and only 10% of negative for segmentation
+        if rle != '-1' or random.random() <= 0.2:
+            # keep all postive and only 20% of negative for segmentation
             new_df.loc[k] = [id, rle]
     new_df.to_csv(new, index=False)
 
