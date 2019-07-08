@@ -648,7 +648,7 @@ def get_best_thr(preds, gt, plot=True):
     thrs = np.arange(0.01, 1, 0.01)
     dices = []
     for i in tqdm(thrs):
-        dices.append(dice(preds_m, valid_gt, thr=i).item())
+        dices.append(dice(preds, gt, thr=i).item())
     dices = np.array(dices)
     best_dice = dices.max()
     best_thr = thrs[dices.argmax()]
@@ -664,7 +664,7 @@ def get_best_thr(preds, gt, plot=True):
 ```
 
 ```{python}
-def create_submission(preds, path, thr=0.5):
+def create_submission(db, preds, path, thr=0.5):
     sub = pd.DataFrame(columns=['ImageId', 'EncodedPixels'])
     index = 0
     for k, pred in tqdm(enumerate(preds.squeeze()), total=preds.size(0)):
