@@ -37,6 +37,12 @@ def run():
             SaveModelCallback(
                 clf, monitor='accuracy', name=save_name)])
 
+    fig = clf.recorder.plot_losses(return_fig=True)
+    fig.save_fig(cfg.FIGS_PATH/f'loss_frozen_{save_name}.png')
+
+    fig = clf.recorder.plot_metrics(return_fig=True)
+    fig.save_fig(cfg.FIGS_PATH/f'acc_frozen_{save_name}.png')
+
     clf.unfreeze()
 
     clf.fit_one_cycle(
@@ -44,6 +50,12 @@ def run():
         callbacks=[
             SaveModelCallback(
                 clf, monitor='accuracy', name=save_name)])
+
+    fig = clf.recorder.plot_losses(return_fig=True)
+    fig.save_fig(cfg.FIGS_PATH/f'loss_unfrozen_{save_name}.png')
+
+    fig = clf.recorder.plot_metrics(return_fig=True)
+    fig.save_fig(cfg.FIGS_PATH/f'acc_unfrozen_{save_name}.png')
 
     torch.save(next(clf.model.children()).state_dict(),
                cfg.MODELS_PATH/f'backbone_{save_name}.pth')
