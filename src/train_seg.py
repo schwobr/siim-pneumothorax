@@ -50,7 +50,7 @@ def run():
     learner.unfreeze()
 
     learner.fit_one_cycle(
-        cfg.UNFROZE_EPOCHS, slice(cfg.LR),
+        cfg.UNFROZE_EPOCHS, slice(cfg.LR/100, cfg.LR),
         callbacks=[
             SaveModelCallback(
                 learner, monitor='dice', name=save_name)])

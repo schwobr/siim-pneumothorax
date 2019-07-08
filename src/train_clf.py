@@ -46,7 +46,7 @@ def run():
     clf.unfreeze()
 
     clf.fit_one_cycle(
-        cfg.UNFROZE_EPOCHS, slice(cfg.LR_CLF),
+        cfg.UNFROZE_EPOCHS, slice(cfg.LR_CLF/50, cfg.LR_CLF),
         callbacks=[
             SaveModelCallback(
                 clf, monitor='accuracy', name=save_name)])
