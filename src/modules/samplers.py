@@ -3,27 +3,22 @@ from torch.utils.data import Sampler
 
 
 class RandomSampler(Sampler):
-    def __init__(self, model, loss, dl, num_samples, bs):
-        assert loss.reduction == 'none', 'Loss function must disable reduction'
-        self.model = model
-        self.bs = bs
-        self.dl = dl.new(shuffle=False, sampler=None)
-        self.loss = loss
+    """
+    Weighted sampler that uniformally draws with replacement with probabilities
+    equal to weights
+
+    num_samples: number of samples to draw at each epoch
+    weights: specify to use user-defined probabilities
+    """
+    def __init__(self, num_samples, weights=None):
+        self.weights = weights.float() if weights is not None else torch.ones(
+            num_samples).float()
+        self.to_update = torch.ones_like(self.weights, dtype=torch.bool)
         self.num_samples = num_samples
 
-    def get_scores(self):
-        losses = []
-        with torch.no_grad():
-            for X, y_true in self.dl:
-                y_pred = self.model(X)
-                loss = self.loss(y_pred, y_true)
-                losses.append(loss)
-        return torch.cat(losses)
-
     def __iter__(self):
-        scores = self.get_scores()
-        return iter(
-            torch.multinomial(scores, self.num_samples, True).tolist())
+        return iter(torch.multinomial(
+            self.weights, self.num_samples, True).tolist())
 
     def __len__(self):
         return self.num_samples

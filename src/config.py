@@ -2,39 +2,35 @@ from pathlib import Path
 
 # IMAGE SIZES
 TRAIN_SIZE = 256
-MAX_SIZE = 1388
-TEST_SIZE = 224
-TEST_OVERLAP = 64
-IMG_CHANNELS = 3
+TEST_SIZE = 256
 
 # PATHS
 PROJECT_PATH = Path(
     '/work/stages/schwob/siim-pneumothorax')
-FULL_TRAIN_PATH = PROJECT_PATH/'data/dicom-images-train'
-FULL_TEST_PATH = PROJECT_PATH/'data/dicom-images-test'
 DATA = PROJECT_PATH/'data'
-TRAIN_PATH = PROJECT_PATH/'data/train'
-TEST_PATH = PROJECT_PATH/'data/test'
+FULL_TRAIN_PATH = DATA/'dicom-images-train'
+FULL_TEST_PATH = DATA/'dicom-images-test'
+FULL_SIZE_TRAIN_PATH = DATA/'train'
+FULL_SIZE_TEST_PATH = DATA/'test'
+TRAIN_PATH = DATA/('train'+str(TRAIN_SIZE))
+TEST_PATH = DATA/('train'+str(TEST_SIZE))
 MODELS_PATH = PROJECT_PATH/'models/'
-STATE_DICT_PATH = MODELS_PATH/'resnet152_backbone_pretrained.pth'
 SUB_PATH = PROJECT_PATH/'submissions/'
-LABELS_OLD = PROJECT_PATH/'data/train-rle.csv'
-LABELS = PROJECT_PATH/'data/train-rle-fastai2.csv'
-LABELS_POS = PROJECT_PATH/'data/train-rle-fastai_pos.csv'
-LABELS_CLASSIF = PROJECT_PATH/'data/train-rle-fastai-classif.csv'
+PRED_PATH = PROJECT_PATH/'preds/'
+FIG_PATH = PROJECT_PATH/'figures/'
+LABELS_OLD = DATA/'train-rle.csv'
+LABELS = DATA/f'train-rle{TRAIN_SIZE}.csv'
+LABELS_POS = DATA/'train-rle-fastai_pos.csv'
+LABELS_CLASSIF = DATA/f'train-rle-clf{TRAIN_SIZE}.csv'
+HYPERS_PATH = PROJECT_PATH/'submissions/hypers.csv'
 LOG = Path('/work/stages/schwob/runs')
-FIGS_PATH = PROJECT_PATH/'figures'
 
 # LEARNER CONFIG
-BATCH_SIZE = 16
-WD = 0.1
+BATCH_SIZE = 8
+WD = 0.
 LR = 1e-3
-LR_CLF = 2e-3
-GROUP_LIMITS = None
-FREEZE_UNTIL = None
-EPOCHS = 20
-UNFROZE_EPOCHS = 10
+EPOCHS = 100
+UNFROZE_EPOCHS = 50
 PRETRAINED = True
 MODEL = 'resnet34'
-CLASSES = ['pneum']
-ACT = 'sigmoid'
+LOG_VARS = (-0.8, -3.8)

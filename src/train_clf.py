@@ -1,14 +1,15 @@
-import torch
-import torch.nn as nn
 import torchvision.models as mod
 
 from fastai.vision.learner import cnn_learner
 from fastai.metrics import accuracy
 from fastai.callbacks import SaveModelCallback
+from fastai.callbacks.tensorboard import LearnerTensorboardWriter
 
 import config as cfg
 from modules.dataset import load_data_classif
 from modules.files import getNextFilePath
+from modules.models import set_BN_momentum
+from modules.callbacks import AccumulateStep
 
 
 def run():
@@ -16,47 +17,39 @@ def run():
         'resnet34': mod.resnet34, 'resnet50': mod.resnet50,
         'resnet101': mod.resnet101, 'resnet152': mod.resnet152}
 
-    db_clf, class_weights = load_data_classif(
-        cfg.LABELS_CLASSIF, bs=cfg.BATCH_SIZE, train_size=cfg.TRAIN_SIZE,
-        weight_sample=True)
+    db = load_data_classif(cfg.LABELS, bs=8*cfg.BATCH_SIZE,
+                           train_size=cfg.TRAIN_SIZE)
 
-    clf = cnn_learner(
-        db_clf, models[cfg.MODEL],
-        pretrained=cfg.PRETRAINED, loss_func=nn.CrossEntropyLoss(
-            weight=torch.tensor(class_weights, device=db_clf.device)),
+    learner = cnn_learner(
+        db, models[cfg.MODEL],
+        pretrained=cfg.PRETRAINED,
         wd=cfg.WD, model_dir=cfg.MODELS_PATH, metrics=[accuracy])
-
-    clf = clf.to_fp16()
 
     save_name = f'clf_{cfg.MODEL}'
     save_name = f'{save_name}_{getNextFilePath(cfg.MODELS_PATH, save_name)}'
 
-    clf.fit_one_cycle(
-        cfg.EPOCHS, slice(cfg.LR_CLF),
+    learner = learner.clip_grad(1.)
+    set_BN_momentum(learner.model)
+
+    learner.fit_one_cycle(
+        cfg.EPOCHS, slice(cfg.LR),
         callbacks=[
             SaveModelCallback(
-                clf, monitor='accuracy', name=save_name)])
+                learner, monitor='valid_loss', name=save_name),
+            AccumulateStep(learner, 64 // cfg.BATCH_SIZE),
+            LearnerTensorboardWriter(
+                learner, cfg.LOG, save_name, loss_iters=10,
+                hist_iters=100, stats_iters=10)])
 
-    fig = clf.recorder.plot_losses(return_fig=True)
-    fig.savefig(cfg.FIGS_PATH/f'loss_frozen_{save_name}.png')
+    learner.unfreeze()
+    uf_save_name = 'uf_'+save_name
 
-    fig = clf.recorder.plot_metrics(return_fig=True)
-    fig.savefig(cfg.FIGS_PATH/f'acc_frozen_{save_name}.png')
-
-    clf.unfreeze()
-
-    clf.fit_one_cycle(
-        cfg.UNFROZE_EPOCHS, slice(cfg.LR_CLF/100, cfg.LR_CLF/5),
+    learner.fit_one_cycle(
+        cfg.EPOCHS, slice(cfg.LR/10),
         callbacks=[
             SaveModelCallback(
-                clf, monitor='accuracy', name=save_name)])
-
-    fig = clf.recorder.plot_losses(return_fig=True)
-    fig.savefig(cfg.FIGS_PATH/f'loss_unfrozen_{save_name}.png')
-
-    fig = clf.recorder.plot_metrics(return_fig=True)
-    fig.savefig(cfg.FIGS_PATH/f'acc_unfrozen_{save_name}.png')
-
-    torch.save(next(clf.model.children()).state_dict(),
-               cfg.MODELS_PATH/f'backbone_{save_name}.pth')
-    clf.destroy()
+                learner, monitor='valid_loss', name=uf_save_name),
+            AccumulateStep(learner, 64 // cfg.BATCH_SIZE),
+            LearnerTensorboardWriter(
+                learner, cfg.LOG, uf_save_name, loss_iters=10,
+                hist_iters=100, stats_iters=10)])

@@ -12,7 +12,15 @@ jupyter:
     name: conda-env-pytorch-py
 ---
 
-```{python}
+<!-- #region {"Collapsed": "false"} -->
+# Kaggle SIIM Pneumothorax Challenge
+<!-- #endregion -->
+
+<!-- #region {"heading_collapsed": true, "Collapsed": "true"} -->
+## Imports
+<!-- #endregion -->
+
+```{python hidden=TRUE, Collapsed=false}
 # %load_ext autoreload
 # %autoreload 2
 
@@ -21,6 +29,7 @@ import cv2
 import PIL
 import random
 import numpy as np
+import inspect
 import os
 import pydicom
 import matplotlib.pyplot as plt
@@ -29,9 +38,15 @@ from tqdm import tqdm_notebook as tqdm
 import pdb
 from dataclasses import dataclass
 from functools import partial
+import datetime
+from io import BytesIO
+from enum import IntEnum
+import sys
+import neptune
 
 from skimage.morphology import label
-from sklearn.model_selection import KFold
+from sklearn.model_selection import KFold, GridSearchCV
+from skorch import NeuralNet
 
 from torchvision import transforms
 import torchvision.transforms.functional as TF
@@ -39,48 +54,59 @@ from torch.nn.functional import binary_cross_entropy_with_logits
 import torch
 import torch.nn as nn
 from torch.utils.data import WeightedRandomSampler, Sampler
+from torch.optim import SGD
 
 from fastai.vision.data import SegmentationItemList, SegmentationLabelList, ImageList, imagenet_stats
-from fastai.data_block import FloatList, FloatItem
-from fastai.basic_data import DatasetType
+from fastai.data_block import FloatList, FloatItem, ItemList, PreProcessor
+from fastai.basic_data import DatasetType, DataBunch
 from fastai.basic_train import Learner
+from fastai.train import GradientClipping
 from fastai.callback import OptimWrapper
+from fastai.core import *
+from fastai.torch_core import to_device, flatten_model, ParameterModule
+from fastai.layers import CrossEntropyFlat, SequentialEx
 from fastai.vision.image import Image, ImageSegment, image2np, pil2tensor
 from fastai.vision.transform import get_transforms
 from fastai.vision.learner import unet_learner, cnn_learner
 import fastai.vision.models as mod
 from fastai.callbacks import SaveModelCallback, LearnerCallback
+from fastai.callbacks.hooks import hook_outputs
+from fastai.callbacks.tensorboard import LearnerTensorboardWriter
 from fastai.metrics import accuracy
+from fastprogress import fastprogress
 
 from pathlib import Path
 
 # IMAGE SIZES
-TRAIN_SIZE = 256
+TRAIN_SIZE = 512
 MAX_SIZE = 1388
-TEST_SIZE = 224
+TEST_SIZE = TRAIN_SIZE
 TEST_OVERLAP = 64
 IMG_CHANNELS = 3
 
 # PATHS
 PROJECT_PATH = Path(
     '/work/stages/schwob/siim-pneumothorax')
-FULL_TRAIN_PATH = PROJECT_PATH/'data/dicom-images-train'
-FULL_TEST_PATH = PROJECT_PATH/'data/dicom-images-test'
 DATA = PROJECT_PATH/'data'
-TRAIN_PATH = PROJECT_PATH/'data/train'
-TEST_PATH = PROJECT_PATH/'data/test'
+FULL_TRAIN_PATH = DATA/'dicom-images-train'
+FULL_TEST_PATH = DATA/'dicom-images-test'
+FULL_SIZE_TRAIN_PATH = DATA/'train'
+FULL_SIZE_TEST_PATH = DATA/'test'
+TRAIN_PATH = DATA/('train'+str(TRAIN_SIZE))
+TEST_PATH = DATA/('test'+str(TEST_SIZE))
 MODELS_PATH = PROJECT_PATH/'models/'
 SUB_PATH = PROJECT_PATH/'submissions/'
-LABELS_OLD = PROJECT_PATH/'data/train-rle.csv'
-LABELS = PROJECT_PATH/'data/train-rle-fastai2.csv'
-LABELS_POS = PROJECT_PATH/'data/train-rle-fastai_pos.csv'
-LABELS_CLASSIF = PROJECT_PATH/'data/train-rle-fastai-classif.csv'
+LABELS_OLD = DATA/'train-rle.csv'
+LABELS = DATA/f'train-rle{TRAIN_SIZE}.csv'
+LABELS_POS = DATA/'train-rle-fastai_pos.csv'
+LABELS_CLASSIF = DATA/f'train-rle-clf{TRAIN_SIZE}.csv'
+HYPERS_PATH = PROJECT_PATH/'submissions/hypers.csv'
 LOG = Path('/work/stages/schwob/runs')
 
 # LEARNER CONFIG
-BATCH_SIZE = 16
-WD = 0.1
-LR = 2e-4
+BATCH_SIZE = 2
+WD = 0.
+LR = 1e-4
 GROUP_LIMITS = None
 FREEZE_UNTIL = None
 EPOCHS = 10
@@ -91,19 +117,45 @@ CLASSES = ['pneum']
 ACT = 'sigmoid'
 ```
 
-```{python}
-from fastai.vision.models.xresnet2 import xresnet34_2, xresnet50_2, xresnet101, xresnet152
+```{python hidden=TRUE, Collapsed=false}
+#from fastai.vision.models.xresnet2 import xresnet34_2, xresnet50_2, xresnet101, xresnet152
 ```
 
-```{python}
+```{python hidden=TRUE, Collapsed=false}
 models = {
     'resnet34': mod.resnet34, 'resnet50': mod.resnet50,
-    'resnet101': mod.resnet101, 'resnet152': mod.resnet152,
-    'xresnet34': xresnet34_2, 'xresnet50': xresnet50_2,
-    'xresnet101': xresnet101, 'xresnet152': xresnet152}
+    'resnet101': mod.resnet101, 'resnet152': mod.resnet152}
+    #'xresnet34': xresnet34_2, 'xresnet50': xresnet50_2,
+    #'xresnet101': xresnet101, 'xresnet152': xresnet152}
 ```
 
-```{python}
+```{python hidden=TRUE, Collapsed=false}
+def delegates(to=None, keep=False):
+    "Decorator: replace `**kwargs` in signature with params from `to`"
+    def _f(f):
+        if to is None: to_f,from_f = f.__base__.__init__,f.__init__
+        else:          to_f,from_f = to,f
+        sig = inspect.signature(from_f)
+        sigd = dict(sig.parameters)
+        k = sigd.pop('kwargs')
+        s2 = {k:v for k,v in inspect.signature(to_f).parameters.items()
+              if v.default != inspect.Parameter.empty and k not in sigd}
+        sigd.update(s2)
+        if keep: sigd['kwargs'] = k
+        from_f.__signature__ = sig.replace(parameters=sigd.values())
+        return f
+    return _f
+```
+
+<!-- #region {"Collapsed": "false"} -->
+## Function definitions
+<!-- #endregion -->
+
+<!-- #region {"heading_collapsed": true, "Collapsed": "true"} -->
+### Data
+<!-- #endregion -->
+
+```{python hidden=TRUE, Collapsed=false}
 def getNextFilePath(output_folder, base_name):
     highest_num = 0
     for f in output_folder.iterdir():
@@ -122,53 +174,95 @@ def getNextFilePath(output_folder, base_name):
     return output_file
 ```
 
-```{python}
+```{python hidden=TRUE, Collapsed=false}
 def restruct(src, dest):
     for fn in src.glob('**/*dcm'):
         ds = pydicom.dcmread(str(fn))
         pydicom.dcmwrite(str(dest/fn.name), ds)
 ```
 
-```{python}
+```{python hidden=TRUE, Collapsed=false}
 #restruct(FULL_TRAIN_PATH, TRAIN_PATH)
 ```
 
-```{python}
+```{python hidden=TRUE, Collapsed=false}
 #restruct(FULL_TEST_PATH, TEST_PATH)
 ```
 
-```{python}
-def change_csv(old, new, path):
-    df = pd.read_csv(old, sep=', ')
-    new_df = pd.DataFrame(columns=['ImageId', 'EncodedPixels'])
-    for row in df.itertuples():
-        image_id = row.ImageId
-        label = row.EncodedPixels
-        image_id = Path(path.name)/(image_id+'.dcm')
-        new_df.loc[row.Index] = [image_id, label]
-    new_df.to_csv(new, index=False)
+```{python hidden=TRUE, Collapsed=false}
+def create_train(full_size_path, path, size):
+    for fn in full_size_path.glob('**/*dcm'):
+        ds = pydicom.dcmread(str(fn))
+        img = ds.pixel_array
+        img = cv2.resize(img, (size, size), interpolation=cv2.INTER_AREA)
+        ds.decompress()
+        ds.PixelData = img.tobytes()
+        ds.Rows, ds.Columns = img.shape
+        pydicom.dcmwrite(str(path/fn.name), ds)
 ```
 
-```{python}
-#change_csv(LABELS_OLD, LABELS, TRAIN_PATH)
+```{python hidden=TRUE, Collapsed=false}
+if not TRAIN_PATH.is_dir():
+    TRAIN_PATH.mkdir()
+    create_train(FULL_SIZE_TRAIN_PATH, TRAIN_PATH, TRAIN_SIZE)
 ```
 
-```{python}
-df = pd.read_csv(LABELS, header='infer')
-df.head()
+```{python Collapsed=false}
+if not TEST_PATH.is_dir():
+    TEST_PATH.mkdir()
+    create_train(FULL_SIZE_TEST_PATH, TEST_PATH, TEST_SIZE)
 ```
 
-```{python}
-df.shape
+```{python hidden=TRUE, Collapsed=false}
+def mask2rle(img, width, height):
+    rle = []
+    lastColor = 0
+    currentPixel = 0
+    runStart = -1
+    runLength = 0
+
+    for x in range(width):
+        for y in range(height):
+            currentColor = img[x][y]
+            if currentColor != lastColor:
+                if currentColor == 255:
+                    runStart = currentPixel
+                    runLength = 1
+                else:
+                    rle.append(str(runStart))
+                    rle.append(str(runLength))
+                    runStart = -1
+                    runLength = 0
+                    currentPixel = 0
+            elif runStart > -1:
+                runLength += 1
+            lastColor = currentColor
+            currentPixel += 1
+
+    return " ".join(rle) if rle != [] else '-1'
 ```
 
-```{python}
-df['ImageId'].unique().shape
+```{python hidden=TRUE, Collapsed=false}
+def rle2mask(rle, width, height):
+    if rle == '-1':
+        return np.zeros((width, height))
+    mask = np.zeros(width * height)
+    array = np.asarray([int(x) for x in rle.split()])
+    starts = array[0::2]
+    lengths = array[1::2]
+
+    current_position = 0
+    for index, start in enumerate(starts):
+        current_position += start
+        mask[current_position:current_position+lengths[index]] = 255
+        current_position += lengths[index]
+
+    return mask.reshape(width, height).T
 ```
 
-```{python}
+```{python hidden=TRUE, Collapsed=false}
 def absol2relat(rle):
-    if rle == '-1': return '-1'
+    if str(rle) == '-1': return '-1'
     pixels = rle.split()
     new_rle = []
     cur = 0
@@ -184,9 +278,9 @@ def absol2relat(rle):
     return ' '.join(new_rle)
 ```
 
-```{python}
+```{python hidden=TRUE, Collapsed=false}
 def relat2absol(rle):
-    if rle == '-1': return '-1'
+    if str(rle) == '-1': return '-1'
     pixels = rle.split()
     new_rle = []
     cur = 0
@@ -200,9 +294,9 @@ def relat2absol(rle):
     return ' '.join(new_rle)
 ```
 
-```{python}
+```{python hidden=TRUE, Collapsed=false}
 def merge_rles(rle1, rle2):
-    if rle1 == rle2: return rle1
+    if str(rle1) == str(rle2): return rle1
     i1 = 0
     i2 = 0
     rle = []
@@ -234,7 +328,7 @@ def merge_rles(rle1, rle2):
     return absol2relat(' '.join(rle))
 ```
 
-```{python}
+```{python hidden=TRUE, Collapsed=false}
 def merge_doubles(old, new):
     df = pd.read_csv(old)
     new_df = pd.DataFrame(columns=['ImageId', 'EncodedPixels'])
@@ -246,11 +340,46 @@ def merge_doubles(old, new):
     new_df.to_csv(new, index=False)
 ```
 
-```{python}
+```{python hidden=TRUE, Collapsed=false}
+def change_csv(old, new, path, size=256):
+    df = pd.read_csv(old, sep=', ')
+    new_df = pd.DataFrame(columns=['ImageId', 'EncodedPixels'])
+    for row in tqdm(df.itertuples(), total=df.shape[0]):
+        image_id = row.ImageId
+        label = row.EncodedPixels
+        image_id = Path(path.name)/(image_id+'.dcm')
+        mask = rle2mask(label, 1024, 1024)
+        mask = cv2.resize(mask, (size, size), interpolation=cv2.INTER_AREA)
+        mask = (mask>127).astype(np.uint8)*255
+        label = mask2rle(mask.T, size, size)
+        new_df.loc[row.Index] = [image_id, label]
+    new_df.to_csv(new, index=False)
+```
+
+```{python hidden=TRUE, Collapsed=false}
+if not LABELS.is_file():
+    change_csv(LABELS_OLD, LABELS, TRAIN_PATH, size=TRAIN_SIZE)
+    merge_doubles(LABELS, LABELS)
+```
+
+```{python hidden=TRUE, Collapsed=false}
+df = pd.read_csv(LABELS, header='infer')
+df.head()
+```
+
+```{python hidden=TRUE, Collapsed=false}
+df.shape
+```
+
+```{python hidden=TRUE, Collapsed=false}
+df['ImageId'].unique().shape
+```
+
+```{python hidden=TRUE, Collapsed=false}
 #merge_doubles(PROJECT_PATH/'data/train-rle-fastai.csv', PROJECT_PATH/'data/train-rle-fastai2.csv')
 ```
 
-```{python}
+```{python hidden=TRUE, Collapsed=false}
 def keep_pos(old, new):
     df = pd.read_csv(old)
     new_df = pd.DataFrame(columns=['ImageId', 'EncodedPixels'])
@@ -264,11 +393,11 @@ def keep_pos(old, new):
     new_df.to_csv(new, index=False)
 ```
 
-```{python}
+```{python hidden=TRUE, Collapsed=false}
 #keep_pos(LABELS, LABELS_POS)
 ```
 
-```{python}
+```{python hidden=TRUE, Collapsed=false}
 def create_classif_csv(old, new):
     df = pd.read_csv(old)
     new_df = pd.DataFrame(columns=['ImageId', 'Labels'])
@@ -279,11 +408,11 @@ def create_classif_csv(old, new):
     new_df.to_csv(new, index=False)
 ```
 
-```{python}
+```{python hidden=TRUE, Collapsed=false}
 #create_classif_csv(LABELS, LABELS_CLASSIF)
 ```
 
-```{python}
+```{python hidden=TRUE, Collapsed=false}
 def open_image(fn):
     return pydicom.dcmread(str(fn)).pixel_array
 
@@ -294,7 +423,7 @@ def show(img, figsize=(10, 10)):
     plt.show()
 ```
 
-```{python}
+```{python hidden=TRUE, Collapsed=false}
 def show_dcm_info(fn):
     dataset = pydicom.dcmread(str(fn))
     print("Filename.........:", fn)
@@ -320,68 +449,21 @@ def show_dcm_info(fn):
             print("Pixel spacing....:", dataset.PixelSpacing)
 ```
 
-```{python}
+```{python hidden=TRUE, Collapsed=false}
 fn = next(TRAIN_PATH.glob('**/*.dcm'))
 img = open_image(fn)
 show(img)
 ```
 
-```{python}
+```{python hidden=TRUE, Collapsed=false}
 show_dcm_info(fn)
 ```
 
-```{python}
+```{python hidden=TRUE, Collapsed=false}
 img.shape
 ```
 
-```{python}
-def mask2rle(img, width, height):
-    rle = []
-    lastColor = 0
-    currentPixel = 0
-    runStart = -1
-    runLength = 0
-
-    for x in range(width):
-        for y in range(height):
-            currentColor = img[x][y]
-            if currentColor != lastColor:
-                if currentColor == 255:
-                    runStart = currentPixel
-                    runLength = 1
-                else:
-                    rle.append(str(runStart))
-                    rle.append(str(runLength))
-                    runStart = -1
-                    runLength = 0
-                    currentPixel = 0
-            elif runStart > -1:
-                runLength += 1
-            lastColor = currentColor
-            currentPixel += 1
-
-    return " ".join(rle)
-```
-
-```{python}
-def rle2mask(rle, width, height):
-    if rle == '-1':
-        return np.zeros((width, height))
-    mask = np.zeros(width * height)
-    array = np.asarray([int(x) for x in rle.split()])
-    starts = array[0::2]
-    lengths = array[1::2]
-
-    current_position = 0
-    for index, start in enumerate(starts):
-        current_position += start
-        mask[current_position:current_position+lengths[index]] = 255
-        current_position += lengths[index]
-
-    return mask.reshape(width, height).T
-```
-
-```{python}
+```{python hidden=TRUE, Collapsed=false}
 class PneumoSegmentationList(SegmentationItemList):
     def open(self, fn):
         x = open_image(fn)
@@ -390,18 +472,19 @@ class PneumoSegmentationList(SegmentationItemList):
         return Image(x/255)
 ```
 
-```{python}
+```{python hidden=TRUE, Collapsed=false}
 class ImageSegmentFloat(ImageSegment):
     @property
     def data(self):
         return self.px.float()
 ```
 
-```{python}
+```{python hidden=TRUE, Collapsed=false}
 class MaskList(SegmentationLabelList):
     def __init__(self, *args, train_path=None, **kwargs):
         super().__init__(*args, **kwargs)
         self.train_path = train_path
+        self.copy_new.append('train_path')
         
     def open(self, fn):
         assert self.train_path, "a path for train set must be specified"
@@ -421,7 +504,24 @@ class MaskList(SegmentationLabelList):
         return ImageSegmentFloat(t.float())
 ```
 
-```{python}
+```{python hidden=TRUE, Collapsed=false}
+class SoftmaxMaskList(SegmentationLabelList):
+    def __init__(self, *args, train_path=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.train_path = train_path
+        self.copy_new.append('train_path')
+        
+    def open(self, fn):
+        assert self.train_path, "a path for train set must be specified"
+        img_path = fn[0]
+        rle = fn[1]
+        h, w = open_image(self.train_path/img_path).shape
+        y = rle2mask(rle, w, h)
+        y = pil2tensor(y, np.float32)
+        return ImageSegment(y/255)
+```
+
+```{python hidden=TRUE, Collapsed=false}
 class PneumoClassifList(ImageList):
     def open(self, fn):
         x = open_image(fn)
@@ -430,11 +530,102 @@ class PneumoClassifList(ImageList):
         return Image(x/255)
 ```
 
-```{python}
+```{python hidden=TRUE, Collapsed=false}
+class MultiTaskLabel(ItemBase):
+    def __init__(self, cat, mask):
+        self.cat = cat
+        self.mask = mask
+        
+    @property
+    def data(self):
+        return [self.cat.data, self.mask.data]
+            
+    def __str__(self):
+        return f'Category {self.cat}; {self.mask}'
+    
+    def show(self, *args, **kwargs):
+        return self.mask.show(*args, **kwargs)
+        
+    def apply_tfms(self, *args, **kwargs):
+        self.mask = self.mask.apply_tfms(*args, **kwargs)
+        return self
+```
+
+```{python hidden=TRUE, Collapsed=false}
+class MultiTaskProcessor(PreProcessor):
+    "`PreProcessor` that create `classes` from `ds.items` and handle the mapping."
+    def __init__(self, ds:ItemList):
+        self.create_classes(ds.classes)
+        self.state_attrs,self.warns = ['classes'],[]
+
+    def create_classes(self, classes):
+        self.classes = classes
+        if classes is not None: self.c2i = {v:k for k,v in enumerate(classes)}
+
+    def generate_classes(self, items):
+        "Generate classes from `items` by taking the sorted unique values."
+        return uniqueify(items, sort=True)
+
+    def process(self, ds):
+        if self.classes is None: self.create_classes(self.generate_classes(ds.items))
+        ds.classes = self.classes
+        ds.c2i = self.c2i
+        ds.c = len(self.classes)
+
+    def __getstate__(self): return {n:getattr(self,n) for n in self.state_attrs}
+    def __setstate__(self, state:dict):
+        self.create_classes(state['classes'])
+        self.state_attrs = state.keys()
+        for n in state.keys():
+            if n!='classes': setattr(self, n, state[n])
+```
+
+```{python hidden=TRUE, Collapsed=false}
+class MultiTaskLabelList(SegmentationLabelList):
+    _bunch,_square_show,_square_show_res = DataBunch,True,True
+    _processor = MultiTaskProcessor
+    def __init__(self, *args, train_path=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.train_path = train_path
+        self.copy_new.append('train_path')
+        
+    def get(self, i):
+        img_path, rle = self.items[i]
+        if str(rle) == '-1':
+            cat = 0
+        else:
+            cat = 1
+        mask = self.open(img_path, rle)
+        return MultiTaskLabel(Category(cat, self.classes[cat]), mask)
+    
+    def open(self, img_path, rle):
+        assert self.train_path, "a path for train set must be specified"
+        h, w = open_image(self.train_path/img_path).shape
+        y = rle2mask(rle, w, h)
+        y = pil2tensor(y, np.float32)
+        return ImageSegment(y/255)
+    
+    def analyze_pred(self, t, thr=0.5):
+        cat, mask = t
+        mask = (mask[1] > thr).long().unsqueeze(0)
+        cat = (cat[1] > thr).long()
+        return (cat, mask)
+    
+    def reconstruct(self, t):
+        cat, mask = t
+        return MultiTaskLabel(Category(cat, self.classes[cat]), ImageSegment(mask))
+```
+
+```{python hidden=TRUE, Collapsed=false}
+class MultiTaskList(PneumoSegmentationList):
+    _bunch, _label_cls = DataBunch, MultiTaskLabelList
+```
+
+```{python hidden=TRUE, Collapsed=false}
 def get_weights(train_list):
     df = train_list.inner_df
     n_tot = df.shape[0]
-    df = df.reindex(index=range(n_tot), method='bfill')
+    df = df.reset_index()
     class_weights = []
     weights = np.zeros(n_tot)    
     for c in train_list.classes:
@@ -445,61 +636,154 @@ def get_weights(train_list):
     return weights, class_weights
 ```
 
-```{python}
+```{python hidden=TRUE, Collapsed=false}
 def create_sampler(train_list, class_weights):
     weights = [class_weights[c.data] for _, c in train_list.train]
     sampler = WeightedRandomSampler(weights, len(weights))
     return sampler
 ```
 
-```{python}
+```{python hidden=TRUE, Collapsed=false}
 def load_data(path, bs=8, train_size=256):
     train_list = (PneumoSegmentationList.
                   from_csv(path.parent, path.name).
                   split_by_rand_pct(valid_pct=0.2).
                   label_from_df(cols=[0, 1], classes=['pneum'], label_cls=MaskList, train_path=path.parent).
-                  transform(get_transforms(), size=train_size, tfm_y=True).
+                  transform(get_transforms(do_flip=False), size=train_size, tfm_y=True).
                   databunch(bs=bs, num_workers=0).
                   normalize(imagenet_stats))
     return train_list
 ```
 
-```{python}
-def load_data_classif(path, bs=8, train_size=256, weight_sample=True):
+```{python hidden=TRUE, Collapsed=false}
+def load_data_softmax(path, bs=8, train_size=256):
+    train_list = (PneumoSegmentationList.
+                  from_csv(path.parent, path.name).
+                  split_by_rand_pct(valid_pct=0.2).
+                  label_from_df(cols=[0, 1], classes=['bg', 'pneum'], label_cls=SoftmaxMaskList, train_path=path.parent).
+                  transform(get_transforms(do_flip=False), size=train_size, tfm_y=True).
+                  databunch(bs=bs, num_workers=0).
+                  normalize(imagenet_stats))
+    return train_list
+```
+
+```{python hidden=TRUE, Collapsed=false}
+def load_data_classif(path, bs=8, train_size=256):
     train_list = (PneumoClassifList.
                   from_csv(path.parent, path.name).
                   split_by_rand_pct(valid_pct=0.2).
                   label_from_df().
-                  transform(get_transforms(), size=train_size))
-    if weight_sample:
-        weights, class_weights = get_weights(train_list)
-        sampler = WeightedRandomSampler(weights, len(weights))
-        
-    train_list = train_list.databunch(bs=bs, num_workers=0).normalize(imagenet_stats)
+                  transform(get_transforms(do_flip=False), size=train_size).
+                  databunch(bs=bs, num_workers=0).
+                  normalize(imagenet_stats))
     
-    if weight_sample:
-        train_list.train_dl = train_list.train_dl.new(shuffle=False, sampler=sampler)
-        return train_list, class_weights
-    
-    return train_list, None
+    return train_list
 ```
 
-```{python}
-db = load_data(LABELS, bs=BATCH_SIZE, train_size=TRAIN_SIZE)
+```{python hidden=TRUE, Collapsed=false}
+def load_data_mtl(path, bs=8, train_size=256):
+    train_list = (MultiTaskList.
+                  from_csv(path.parent, path.name).
+                  split_by_rand_pct(valid_pct=0.2).
+                  label_from_df(cols=[0, 1], classes=['bg', 'pneum'], label_cls=MultiTaskLabelList, train_path=path.parent).
+                  transform(get_transforms(do_flip=False), size=train_size, tfm_y=True).
+                  databunch(bs=bs, num_workers=0))
+    return train_list
 ```
 
-```{python}
-db.show_batch(rows=3, cmap=plt.cm.bone)
+```{python hidden=TRUE, Collapsed=false}
+def get_weights_sampler(db, beta=0.8):
+    df = db.train_ds.inner_df
+    n_tot = df.shape[0]
+    df = df.reset_index()
+    weights = np.zeros(n_tot)
+    weights[df.loc[df['EncodedPixels']=='-1'].index.values] = 1-beta
+    weights[df.loc[df['EncodedPixels']!='-1'].index.values] = beta
+    return weights
 ```
 
-```{python}
-def dice(input, target, thr=0.2, smooth=1., reduction='mean'):
-    assert input.shape==target.shape, "input and target must have same shape"
-    iflat = torch.sigmoid(input).view(input.size(0), -1)
-    if thr: iflat = (iflat>thr).float()
-    tflat = target.view(target.size(0), -1)
+<!-- #region {"heading_collapsed": true, "Collapsed": "true"} -->
+### Models
+<!-- #endregion -->
+
+```{python hidden=TRUE, Collapsed=false}
+def forward(self, x):
+        res = x
+        orig = x.orig
+        for l in self:
+            res.orig = orig
+            nres = l(res)
+            # We have to remove res.orig to avoid hanging refs and therefore memory leaks
+            res.orig = None
+            res = nres
+        res.orig = orig
+        return res
+nn.ModuleList.forward = forward
+```
+
+```{python hidden=TRUE, Collapsed=false}
+class MultiTaskModel(nn.Module):
+    def __init__(self, base, heads):
+        super().__init__()
+        self.base = base
+        self.heads = nn.ModuleList(heads)
+        self.log_vars = ParameterModule(nn.Parameter(torch.zeros(len(self.heads))))
+
+    def forward(self, x):
+        res = x
+        res.orig = x
+        nres = self.base(res)
+        res.orig = None
+        res = nres
+        all_res = []
+        for head in self.heads:  
+            res.orig = x
+            nres = head(res)
+            all_res.append(nres)
+            res.orig = None
+        return all_res
+
+    def __getitem__(self,i): return self.heads[i]
+    def append(self,l): return self.heads.append(l)
+    def extend(self,l): return self.heads.extend(l)
+    def insert(self,i,l): return self.heads.insert(i,l)
+```
+
+```{python hidden=TRUE, Collapsed=false}
+def multi_task_unet_learner(*args, **kwargs):
+    unet_learn = unet_learner(*args, **kwargs)
+    sfs_idxs = unet_learn.model.sfs_idxs
+    cnn_learn = cnn_learner(*args, **kwargs)
+    base = unet_learn.model[0]
+    unet_head = unet_learn.model[1:]
+    hooks = hook_outputs([base[i] for i in sfs_idxs])
+    for block, hook in zip(unet_head[3:7], hooks):
+        block.hook = hook
+    heads = [cnn_learn.model[1:], unet_head]
+    unet_learn.model = MultiTaskModel(base, heads).to(unet_learn.data.device)
+    lg = unet_learn.layer_groups
+    lg[2] = nn.Sequential(*list(lg[2]), *flatten_model(heads[0]), unet_learn.model.log_vars)
+    unet_learn.layer_groups = lg
+    unet_learn.create_opt(slice(1e-3))
+    return unet_learn
+```
+
+<!-- #region {"heading_collapsed": true, "Collapsed": "true"} -->
+### Metrics
+<!-- #endregion -->
+
+```{python hidden=TRUE, Collapsed=false}
+def dice(input, target, smooth=1., reduction='mean', thr=None, activ='softmax', **kwargs):
+    act = nn.Softmax(dim=1) if activ=='softmax' else nn.Sigmoid()
+    iflat = act(input)
+    if activ=='softmax':
+        iflat = iflat[:, 1]
+    iflat = iflat.view(input.size(0),  -1).float()
+    tflat = target.view(target.size(0), -1).float()
+    if thr is not None:
+        iflat = (iflat > thr).float()
     intersection = (iflat * tflat).sum(-1)
-    dice = (2. * intersection + smooth)/(iflat.sum(-1) + tflat.sum(-1) + smooth)
+    dice = (2. * intersection + smooth)/((iflat + tflat).sum(-1) + smooth)
     if reduction=='mean':
         return dice.mean()
     elif reduction=='sum':
@@ -508,19 +792,111 @@ def dice(input, target, thr=0.2, smooth=1., reduction='mean'):
         return dice
 ```
 
-```{python}
-def dice_loss(input, target, **kwargs):
-    return 1-dice(input, target, **kwargs)
+```{python hidden=TRUE, Collapsed=false}
+def mtl_metric(metric, dim=0):
+    def new_metric(input, *targets, **kwargs):
+        return metric(input[dim], targets[dim], **kwargs)
+    new_metric.__name__ = metric.__name__
+    return new_metric
 ```
 
-```{python}
-def bce_loss(input, target, reduction='mean', beta=None):
+```{python hidden=TRUE, Collapsed=false}
+def average_mtl_metric(metrics, dims):
+    def new_metric(input, *targets, **kwargs):
+        scores = []
+        for metric, dim in zip(metrics, dims):
+            scores.append(metric(input[dim], targets[dim], **kwargs))
+        return sum(scores)/len(scores)
+    new_metric.__name__ = '_'.join(metric.__name__ for metric in metrics)
+    return new_metric    
+```
+
+```{python hidden=TRUE, Collapsed=false}
+def mtl_scores(learner, thrs, ds_type=DatasetType.Valid):
+    dices = torch.zeros(len(thrs))
+    dices_pos = torch.zeros(len(thrs))
+    fp_rates = torch.zeros(len(thrs))
+    fn_rates = torch.zeros(len(thrs))
+    dl = learner.data.dl(ds_type)
+    pos_count = 0
+    for x, targs in tqdm(dl):
+        y_cat, y_mask = learner.pred_batch(batch=(x, targs))
+        y_cat = nn.Softmax(dim=1)(y_cat.cuda())
+        y_mask = nn.Softmax(dim=1)(y_mask.cuda())
+        n = y_mask.shape[0]
+        targ_cats, targ_masks = targs
+        targ_masks = targ_masks.float().view(n, -1)
+        targ_cats = targ_cats.float()
+        y_mask = y_mask[:, 1]
+        y_cat = y_cat[:, 1]
+        y_mask = y_mask.view(n, -1)
+        y_mask[y_mask.sum(-1) < 5e-3*TEST_SIZE**2] = 0.0
+        pos_idxs = (targ_masks.max(dim=1).values == 1).nonzero().squeeze(1)
+        targ_masks_pos = targ_masks[pos_idxs]
+        y_mask_pos = y_mask[pos_idxs]
+        pos_count += pos_idxs.size(0)
+        for k, thr in enumerate(thrs):
+            pred_masks = (y_mask>thr).float()
+            intersect = (pred_masks * targ_masks).sum(-1).float()
+            union = (pred_masks+targ_masks).sum(-1).float()
+            u0 = union==0
+            intersect[u0] = 1
+            union[u0] = 2
+            dices[k] += (2. * intersect / union).mean().cpu()
+            
+            if pos_idxs.size(0) > 0:
+                pred_masks_pos = (y_mask_pos>thr).float()
+                intersect = (pred_masks_pos * targ_masks_pos).sum(-1).float()
+                union = (pred_masks_pos+targ_masks_pos).sum(-1).float()
+                dices_pos[k] += (2. * intersect / union).mean().cpu()
+            
+            pred_cats = (y_cat>thr).float()
+            fp_rate = ((((1-targ_cats)*pred_cats).sum()+1e-7)/((1-targ_cats).sum()+1e-7)).cpu()
+            fn_rate = (((targ_cats*(1-pred_cats)).sum()+1e-7)/(targ_cats.sum()+1e-7)).cpu()
+            fp_rates[k] += fp_rate
+            fn_rates[k] += fn_rate
+    return [dices_pos.numpy()/pos_count]+list(map(lambda x: x.numpy()/len(dl), [dices, fp_rates, fn_rates]))
+```
+
+```{python hidden=TRUE, Collapsed=false}
+def dice_overall(learner, thrs, ds_type=DatasetType.Valid):
+    dices = torch.zeros(len(thrs))
+    dl = learner.data.dl(ds_type)
+    for x, targs in tqdm(dl):
+        y_pred = learner.pred_batch(batch=(x, targs)).cuda()
+        n = y_pred.shape[0]
+        targs = targs.float().view(n, -1)
+        y_pred = y_pred[:, 1]
+        y_pred[y_pred.view(n,-1).sum(-1) < 5e-3*TEST_SIZE**2,...] = 0.0
+        for k, thr in enumerate(thrs):
+            preds = (y_pred>thr).float().view(n, -1)            
+            intersect = (preds * targs).sum(-1).float()
+            union = (preds+targs).sum(-1).float()
+            u0 = union==0
+            intersect[u0] = 1
+            union[u0] = 2
+            dices[k] += (2. * intersect / union).mean().cpu()
+    return dices/len(dl)
+```
+
+<!-- #region {"heading_collapsed": true, "Collapsed": "true"} -->
+### Losses
+<!-- #endregion -->
+
+```{python hidden=TRUE, Collapsed=false}
+@delegates(dice)
+def dice_loss(input, target, **kwargs):
+    return 1-dice(input, target, thr=None, **kwargs)
+```
+
+```{python hidden=TRUE, Collapsed=false}
+def bce_loss(input, target, reduction='mean', beta=0.5, eps=1e-7, **kwargs):
     n = input.size(0)
-    iflat = torch.sigmoid(input).view(n, -1)
+    iflat = torch.sigmoid(input).view(n, -1).clamp(eps, 1-eps)
     tflat = target.view(n, -1)
-    if not beta:
-        beta = 0.5
-    bce = -2*(beta*tflat*iflat.log()+(1-beta)*(1-tflat)*(1-iflat).log()).mean(-1)
+    bce = -(beta*tflat*iflat.log()+(1-beta)*(1-tflat)*(1-iflat).log()).mean(-1)
+    if torch.isnan(bce.mean()) or torch.isinf(bce.mean()):
+        pdb.set_trace()
     if reduction == 'mean':
         return bce.mean()
     elif reduction == 'sum':
@@ -529,14 +905,44 @@ def bce_loss(input, target, reduction='mean', beta=None):
         return bce
 ```
 
-```{python}
-def bce_dice_loss(input, target, a=0.5, b=0.5, smooth=1., thr=None, beta=None, reduction='mean', **kwargs):
-    dice =  dice_loss(input, target, smooth=smooth, thr=thr, reduction=reduction, **kwargs)
-    bce = bce_loss(input, target, beta=beta, reduction=reduction, **kwargs)
-    return a*dice+b*bce
+```{python hidden=TRUE, Collapsed=false}
+def focal_loss(input, target, reduction='mean', beta=0.5, gamma=2., eps=1e-7, **kwargs):
+    n = input.size(0)
+    iflat = torch.sigmoid(input).view(n, -1).clamp(eps, 1-eps)
+    tflat = target.view(n, -1)
+    focal = -(beta*tflat*(1-iflat).pow(gamma)*iflat.log()+
+             (1-beta)*(1-tflat)*iflat.pow(gamma)*(1-iflat).log()).mean(-1)
+    if torch.isnan(focal.mean()) or torch.isinf(focal.mean()):
+        pdb.set_trace()
+    if reduction == 'mean':
+        return focal.mean()
+    elif reduction == 'sum':
+        return focal.sum()
+    else:
+        return focal    
 ```
 
-```{python}
+```{python hidden=TRUE, Collapsed=false}
+@delegates(dice_loss)
+def bce_dice_loss(input, target, a=0.5, b=0.5, smooth=1., beta=0.5, reduction='mean', **kwargs):
+    dice =  dice_loss(input, target, smooth=smooth, reduction=reduction, **kwargs)
+    bce = bce_loss(input, target, beta=beta, reduction=reduction, **kwargs)
+    return a*bce+b*dice
+```
+
+```{python hidden=TRUE, Collapsed=false}
+class MTLLoss(nn.Module):    
+    def __init__(self, *loss_funcs):
+        super().__init__()
+        self.losses = []
+        self.loss_funcs = loss_funcs
+        
+    def forward(self, inputs, *targets):
+        self.losses = [func(input, target) for func, input, target in zip(self.loss_funcs, inputs, targets)]
+        return sum(self.losses)/len(self.losses)
+```
+
+```{python hidden=TRUE, Collapsed=false}
 @dataclass
 class URLoss():
     func : nn.Module
@@ -560,20 +966,21 @@ class URLoss():
         self.__dict__.update(data)
 ```
 
-```{python}
+```{python hidden=TRUE, Collapsed=false}
 class DiceLoss(nn.Module):
-    def __init__(self, smooth=1., reduction='mean'):
+    def __init__(self, smooth=1., reduction='mean', smooth_num=True):
         super().__init__()
         self.smooth = smooth
         self.reduction = reduction
+        self.smooth_num = smooth_num
     
     def forward(self, input, target):
-        return dice_loss(input, target, smooth=self.smooth, thr=None, reduction=self.reduction)
+        return dice_loss(input, target, smooth=self.smooth, reduction=self.reduction, smooth_num=self.smooth_num)
 ```
 
-```{python}
+```{python hidden=TRUE, Collapsed=false}
 class BCELoss(nn.Module):
-    def __init__(self, beta=None, reduction='mean'):
+    def __init__(self, beta=0.5, reduction='mean'):
         super().__init__()
         self.beta = beta
         self.reduction = reduction
@@ -582,25 +989,50 @@ class BCELoss(nn.Module):
         return bce_loss(input, target, reduction=self.reduction, beta=self.beta)
 ```
 
-```{python}
+```{python hidden=TRUE, Collapsed=false}
 class BCEDiceLoss(nn.Module):
-    def __init__(self, a=0.5, b=0.5, smooth=1., beta=None, reduction='mean'):
+    def __init__(self, a=0.5, b=0.5, smooth=1., beta=0.5, reduction='mean', smooth_num=True):
         super().__init__()
         self.a = a
         self.b = b
         self.smooth = smooth
         self.beta = beta
         self.reduction = reduction
+        self.smooth_num = smooth_num
         
     def forward(self, input, target, **kwargs):
-        return bce_dice_loss(input, target, a=self.a, b=self.b, smooth=self.smooth, thr=None, beta=self.beta, reduction=self.reduction)
+        return bce_dice_loss(input, target, a=self.a, b=self.b, smooth=self.smooth, beta=self.beta,
+                             reduction=self.reduction, smooth_num=self.smooth_num, **kwargs)
 ```
 
-```{python}
+```{python hidden=TRUE, Collapsed=false}
+class FocalDiceLoss(nn.Module):
+    def __init__(self, a=0.5, b=0.5, smooth=1., beta=0.5, gamma=2., reduction='mean', smooth_num=True):
+        super().__init__()
+        self.a = a
+        self.b = b
+        self.smooth = smooth
+        self.beta = beta
+        self.gamma = gamma
+        self.reduction = reduction
+        self.smooth_num = smooth_num
+        
+    def forward(self, input, target, **kwargs):
+        focal = focal_loss(input, target, beta=self.beta, gamma=self.gamma, reduction=self.reduction, **kwargs)
+        dice = dice_loss(input, target, smooth=self.smooth, reduction=self.reduction,
+                         smooth_num=self.smooth_num, **kwargs)
+        return self.a*focal+self.b*dice
+```
+
+<!-- #region {"heading_collapsed": true, "Collapsed": "true"} -->
+### Callbacks
+<!-- #endregion -->
+
+```{python hidden=TRUE, Collapsed=false}
 from itertools import tee
 def new_iter(self):
     dl = iter(self.dl)
-    dl.sample_iter, self.sample_iter = tee(dl.sample_iter)
+    dl.sampler_iter, self.sampler_iter = tee(dl.sampler_iter)
     for b in dl:
         yield self.proc_batch(b)
 
@@ -608,11 +1040,10 @@ from fastai.basic_data import DeviceDataLoader
 DeviceDataLoader.__iter__= new_iter
 ```
 
-```{python}
+```{python hidden=TRUE, Collapsed=false}
 class RandomSampler(Sampler):
     def __init__(self, num_samples, weights = None):
-        self.weights = weights if weights is not None else torch.ones(num_samples)
-        self.to_update = torch.ones_like(self.weights, dtype=torch.bool)
+        self.weights = weights.float() if weights is not None else torch.ones(num_samples).float()
         self.num_samples = num_samples
 
     def __iter__(self):
@@ -622,24 +1053,37 @@ class RandomSampler(Sampler):
         return self.num_samples
 ```
 
-```{python}
+```{python hidden=TRUE, Collapsed=false}
 class UpdateSamplerCallback(LearnerCallback):
     _order = 0
+    def __init__(self, *args, do_update=True, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.weights = self.learn.data.train_dl.sampler.weights.clone()
+        self.to_update = torch.ones_like(self.weights, dtype=torch.bool)
+        self.do_update = do_update
+    
+    def on_epoch_begin(self, **kwargs):
+        if self.do_update:
+            sampler = self.learn.data.train_dl.sampler
+            sampler.weights = self.weights.clone()
+        
     def on_epoch_end(self, **kwargs):
-        sampler = self.learn.data.train_dl.sampler
-        sampler.weights[sampler.to_update] += 0.2
-        sampler.weights = torch.clamp(sampler.weights, 0., 1.)
-        sampler.to_update = torch.ones_like(sampler.weights, dtype=torch.bool)
+        self.weights[self.to_update] *= 1.5
+        self.weights = torch.clamp(sampler.weights, 0., 1.)
+        self.to_update = torch.ones_like(self.weights, dtype=torch.bool)
         
     def on_backward_begin(self, **kwargs):
-        loss = self.learn.loss_func.loss
+        loss = self.learn.loss_func.loss.float().detach()
+        n = min(learner.data.batch_size, loss.size(0))
+        loss = loss.view(n, -1)
+        loss = loss.mean(-1)
         dl = self.learn.data.train_dl
-        idxs = next(dl.sample_iter)
-        dl.sampler.weights[idxs] = 1-torch.exp(-loss.cpu().detach())
-        dl.sampler.to_update[idxs] = False
+        idxs = next(dl.sampler_iter)
+        self.weights[idxs] = 1-torch.exp(-loss.cpu())
+        self.to_update[idxs] = False
 ```
 
-```{python}
+```{python hidden=TRUE, Collapsed=false}
 class AccumulateOptimWrapper(OptimWrapper):
     def step(self):           pass
     def zero_grad(self):      pass
@@ -653,7 +1097,7 @@ def acc_create_opt(self, lr, wd=0.):
 Learner.create_opt = acc_create_opt   
 ```
 
-```{python}
+```{python hidden=TRUE, Collapsed=false}
 @dataclass
 class AccumulateStep(LearnerCallback):
     """
@@ -662,6 +1106,7 @@ class AccumulateStep(LearnerCallback):
     def __init__(self, learn:Learner, n_step:int = 1):
         super().__init__(learn)
         self.n_step = n_step
+        self.acc_batches = 0
 
     def on_epoch_begin(self, **kwargs):
         "init samples and batches, change optimizer"
@@ -691,314 +1136,647 @@ class AccumulateStep(LearnerCallback):
             self.acc_batches = 0
 ```
 
-```{python}
+```{python hidden=TRUE, Collapsed=false}
+class MonitorGrad(LearnerCallback):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.grads = []
+
+    def on_backward_end(self, **kwargs):
+        grads = []
+        for p in self.learn.model.parameters():
+            if p.grad is not None:
+                grad = p.grad.float().mean()
+                grads.append(grad.item())
+        mean_grad = sum(grads)/len(grads)
+        self.grads.append(mean_grad)
+```
+
+```{python hidden=TRUE, Collapsed=false}
+class MTLLossCallback(LearnerCallback):
+    _order = -100
+    
+    def on_loss_end(self, **kwargs):
+        losses = self.learn.loss_func.losses
+        losses = [loss*torch.exp(-log_var)+log_var/2 for log_var, loss in zip(self.learn.model.log_vars.val, losses)]
+        return {'last_loss': sum(losses)/len(losses)}
+```
+
+```{python hidden=TRUE, Collapsed=false}
+class NeptuneCallback(LearnerCallback):
+    _order = 500
+
+    def __init__(self, learner, project, name='Untitled', params={}, **kwargs):
+        super().__init__(learner, **kwargs)
+        self.exp = project.create_experiment(name=name, params=params)
+
+    def on_backward_begin(self, last_loss, iteration, **kwargs):
+        self.exp.send_metric('train_loss', iteration, last_loss)
+
+    def on_epoch_end(self, last_metrics, epoch, **kwargs):
+        metric_names = [met.__name__ for met in self.learn.metrics]
+        for m, v in zip(metric_names, last_metrics[1:]):
+            self.exp.send_metric(m, epoch, v)
+
+    def on_train_end(self, **kwargs):
+        self.exp.stop()
+```
+
+```{python hidden=TRUE, Collapsed=false}
 def set_BN_momentum(model,momentum=0.05):
     for layer in model.modules():
         if isinstance(layer, nn.BatchNorm2d) or isinstance(layer, nn.BatchNorm1d):
             layer.momentum = momentum
 ```
 
-```{python}
-clf_name = f'backbone_clf_{MODEL}'
-clf_name = f'{clf_name}_{getNextFilePath(MODELS_PATH, clf_name)-1}.pth'
-clf_name
+```{python hidden=TRUE, Collapsed=false}
+def on_backward_end(self, **kwargs):
+    "Clip the gradient before the optimizer step."
+    if self.clip: nn.utils.clip_grad_value_(self.learn.model.parameters(), self.clip)
+        
+#GradientClipping.on_backward_end = on_backward_end
 ```
 
-```{python}
-save_name = f'seg_{MODEL}'
-save_name = f'{save_name}_{getNextFilePath(MODELS_PATH, save_name)-1}'
-save_name
+<!-- #region {"heading_collapsed": true, "Collapsed": "true"} -->
+### Submission
+<!-- #endregion -->
+
+```{python hidden=TRUE, Collapsed=false}
+def hyper_csv(path, **kwargs):
+    if path.is_file():
+        old_df = pd.read_csv(path)
+        old_columns = old_df.columns.values
+        new_columns = list(kwargs)
+        columns = np.union1d(old_columns, new_columns)
+        df = pd.DataFrame(columns=columns)
+        df = df.append([kwargs])
+        df = pd.merge(old_df, df, how='outer')
+    else:
+        df = pd.DataFrame([kwargs])
+    df.to_csv(path, index=False)
+    return df
 ```
 
-```{python}
-learner = unet_learner(db, models[MODEL], pretrained=PRETRAINED, loss_func=URLoss(BCEDiceLoss(a=0.5, b=0.5, beta=0.7, smooth=0.1)),
-                       wd=WD, model_dir=MODELS_PATH, metrics=[partial(dice, smooth=0.1)])
-```
-
-```{python}
-next(learner.model.children())[0].load_state_dict(torch.load(MODELS_PATH/clf_name))
-```
-
-```{python}
-learner = learner.to_fp16()
-```
-
-```{python}
-learner.lr_find(num_it=200)
-```
-
-```{python}
-learner.recorder.plot()
-```
-
-```{python}
-learner.destroy()
-```
-
-```{python}
-LR = 1e-3
-```
-
-```{python}
-sampler = RandomSampler(len(db.train_ds))
-```
-
-```{python}
-learner.data.train_dl = db.train_dl.new(shuffle=False, sampler=sampler)
-```
-
-```{python}
-set_BN_momentum(learner.model)
-```
-
-```{python}
-learner.fit_one_cycle(
-    10, slice(LR),
-    callbacks=[
-        SaveModelCallback(
-            learner, monitor='dice', name=save_name),
-        UpdateSamplerCallback(learner),
-        AccumulateStep(learner, 64//BATCH_SIZE)])
-```
-
-```{python}
-learner.recorder.plot_losses()
-```
-
-```{python}
-learner.recorder.plot_metrics()
-```
-
-```{python}
-learner.show_results()
-```
-
-```{python}
-torch.max(learner.get_preds[0])
-```
-
-```{python}
-test_list = (PneumoSegmentationList.
-             from_folder(TEST_PATH, extensions=['.dcm']))
-db.add_test(test_list, tfms=(), tfm_y=False)
-```
-
-```{python}
-learner.destroy()
-learner = unet_learner(db, models[MODEL], pretrained=PRETRAINED, loss_func=URLoss(BCEDiceLoss(a=0.5, b=0.5, beta=0.7, smooth=0.1)), wd=WD, model_dir=MODELS_PATH, metrics=[partial(dice, smooth=0.1)])
-learner.load(save_name)
-learner = learner.to_fp16()
-```
-
-```{python}
-sampler = RandomSampler(len(db.train_ds))
-```
-
-```{python}
-learner.data.train_dl = db.train_dl.new(shuffle=False, sampler=sampler)
-```
-
-```{python}
-preds, gt = learner.get_preds(DatasetType.Test)
-```
-
-```{python}
-torch.min(preds), torch.max(preds)
-```
-
-```{python}
-preds = torch.sigmoid(preds)
-```
-
-```{python}
-torch.max(preds)
-```
-
-```{python}
-preds[preds.view(preds.shape[0],-1).sum(-1) < 75.0*4,...] = 0.0
-```
-
-```{python}
-torch.max(preds)
-```
-
-```{python}
-valid_preds, valid_gt = learner.get_preds(DatasetType.Valid)
-```
-
-```{python}
-valid_preds = torch.sigmoid(valid_preds)
-torch.max(valid_preds)
-```
-
-```{python}
-valid_preds[valid_preds.view(valid_preds.shape[0],-1).sum(-1) < 75.0*4,...] = 0.0
-```
-
-```{python}
-#torch.max(valid_preds)
-```
-
-```{python}
-def dice_overall(preds, targs, thr):
-    n = preds.shape[0]
-    preds = (preds>thr).float().view(n, -1)
-    targs = targs.view(n, -1)
-    intersect = (preds * targs).sum(-1).float()
-    union = (preds+targs).sum(-1).float()
-    u0 = union==0
-    intersect[u0] = 1
-    union[u0] = 2
-    return (2. * intersect / union).mean()
-```
-
-```{python}
-def get_best_thr(preds, gt, plot=True):
+```{python hidden=TRUE, Collapsed=false}
+def get_best_thr(learner, plot=True):
     thrs = np.arange(0.1, 1, 0.01)
-    dices = []
-    for i in tqdm(thrs):
-        dices.append(dice_overall(preds, gt, thr=i).item())
-    dices = np.array(dices)
+    dices = dice_overall(learner, thrs)
+    dices = dices.numpy()
     best_dice = dices.max()
     best_thr = thrs[dices.argmax()]
-    
     if plot:
         plt.figure(figsize=(8,4))
         plt.plot(thrs, dices)
         plt.vlines(x=best_thr, ymin=dices.min(), ymax=dices.max())
-        plt.text(best_thr+0.03, best_dice-0.01, f'DICE = {best_dice:.3f}', fontsize=14);
+        plt.text(best_thr+0.03, best_dice-0.01, f'DICE = {best_dice:.3f}', fontsize=14)
         plt.show()
     
     return best_thr
 ```
 
-```{python}
-thr = get_best_thr(valid_preds, valid_gt)
+```{python hidden=TRUE, Collapsed=false}
+def get_best_thr_clf(learner, plot=True):
+    thrs = np.arange(0.1, 1, 0.01)
+    preds, gt = learner.get_preds()
+    gt = gt.float()
+    preds = preds[:, 1]
+    fp_rates = []
+    fn_rates = []
+    scores= []
+    best_score = 10000
+    best_thr = 0.5
+    for thr in thrs:
+        fp_rate = (((1-gt)*(preds>thr).float()).sum()+1e-7)/((1-gt).sum()+1e-7)
+        fp_rates.append(fp_rate)
+        fn_rate = ((gt*(1-(preds>thr).float())).sum()+1e-7)/(gt.sum()+1e-7)
+        fn_rates.append(fn_rate)
+        score = fp_rate+fn_rate
+        scores.append(score)
+        if score < best_score:
+            best_thr = thr
+            best_score = score
+    fp_rates = np.array(fp_rates)
+    fn_rates = np.array(fn_rates)
+    scores = np.array(scores)
+    if plot:
+        plt.figure(figsize=(8,4))
+        plt.plot(thrs, fp_rates, label='fp rate')
+        plt.plot(thrs, fn_rates, label='fn rate')
+        plt.plot(thrs, scores, label='fp rate + fn rate')
+        plt.vlines(x=best_thr, ymin=fp_rates.min(), ymax=fp_rates.max())
+        plt.legend()
+        plt.show()    
+        
+    return best_thr
 ```
 
-```{python}
-thr
+```{python hidden=TRUE, Collapsed=false}
+def get_best_thrs_mtl(learner, plot=True, a=0.8):
+    thrs = np.arange(0.1, 1, 0.01)
+    dices_pos, dices, fp_rates, fn_rates = mtl_scores(learner, thrs)
+    dice_scores = a*dices_pos+(1-a)*dices
+    scores = a*fp_rates+(1-a)*fn_rates
+    best_dice = (dice_scores).max()
+    best_thr = thrs[(dice_scores).argmax()]
+    best_score = scores.min()
+    best_thr_clf = thrs[scores.argmin()]
+    if plot:
+        plt.figure(figsize=(8,4))
+        plt.plot(thrs, dice_scores, label='dice')
+        plt.vlines(x=best_thr, ymin=dice_scores.min(), ymax=dice_scores.max())
+        plt.text(best_thr+0.03, best_dice-0.01, f'DICE = {best_dice:.3f}', fontsize=14)
+        
+        plt.plot(thrs, fp_rates, label='fp rate')
+        plt.plot(thrs, fn_rates, label='fn rate')
+        plt.plot(thrs, scores, label=f'{a}*fp rate + {1-a}*fn rate')
+        plt.vlines(x=best_thr_clf, ymin=0, ymax=scores.min())
+        plt.text(best_thr_clf+0.03, best_score-0.01, f'FP + FN = {best_score:.3f}', fontsize=14)
+        
+        plt.legend()
+        plt.show()  
+    return best_thr, best_thr_clf
 ```
 
-```{python}
-def create_submission(db, preds, path, thr=0.5):
+```{python hidden=TRUE, Collapsed=false}
+def create_submission(learner, path, thr=0.5):
     sub = pd.DataFrame(columns=['ImageId', 'EncodedPixels'])
-    index = 0
-    for k, pred in tqdm(enumerate(preds.squeeze(1)), total=preds.size(0)):
-        y = pred.numpy()
-        y = cv2.resize(y, (1024, 1024), interpolation=cv2.INTER_CUBIC)
-        labels = label(y > thr)
-        id = db.test_ds.items[k].with_suffix('').name
-        for i in range(1, labels.max()+1):
-            mask = (labels == i).astype(np.uint8)*255
-            if np.count_nonzero(mask) > 30:
-                rle = mask2rle(mask.T, 1024, 1024)
-                sub.loc[index] = [id, rle]
-                index += 1
-        if id not in sub['ImageId'].values:
-            sub.loc[index] = [id, '-1']
-            index += 1
+    for x, y in tqdm(learner.data.test_dl):
+        preds = learner.pred_batch(batch=(x, y))
+        preds = preds[:, 1]
+        preds[preds.view(preds.shape[0],-1).sum(-1) < 5e-3*TEST_SIZE**2,...] = 0.0
+        idxs = next(learner.data.test_dl.sampler_iter)
+        for k, pred in enumerate(preds.squeeze(1)):
+            y = pred.numpy()
+            if y.shape[-1] != 1024:
+                y = cv2.resize(y, (1024, 1024), interpolation=cv2.INTER_AREA)
+            y = (y > thr).astype(np.uint8)*255
+            id = learner.data.test_ds.items[idxs[k]].with_suffix('').name
+            rle = mask2rle(y.T, *y.shape[-2:])
+            sub.loc[idxs[k]] = [id, rle]
     sub.to_csv(path, index=False)
     return sub
 ```
 
-```{python}
-fn = '1_'+save_name+'.csv'
-sub_df = create_submission(db, preds, SUB_PATH/fn, thr=thr)
+```{python hidden=TRUE, Collapsed=false}
+def create_submission_with_clf(learner, path, ids, thr=0.5):
+    sub_df = create_submission(learner, path, thr=thr)
+    n = sub_df.shape[0]
+    for k, id in enumerate(ids):
+        sub_df.loc[n+k] = [id.with_suffix('').name, '-1']
+    sub_df.to_csv(path, index=False)
+    return sub_df
 ```
 
-```{python}
-(valid_preds>thr).unique(return_counts=True)
+```{python hidden=TRUE, Collapsed=false}
+def create_submission_mtl(learner, path, thr=0.5, thr_clf=0.5):
+    sub = pd.DataFrame(columns=['ImageId', 'EncodedPixels'])
+    for x, y in tqdm(learner.data.test_dl):
+        y_cat, y_mask = learner.pred_batch(batch=(x, y))
+        y_cat = nn.Softmax(dim=1)(y_cat)[:, 1]
+        y_mask = nn.Softmax(dim=1)(y_mask)[:, 1]
+        y_mask[y_mask.view(y_mask.shape[0],-1).sum(-1) < 1e-3*TEST_SIZE**2,...] = 0.0
+        idxs = next(learner.data.test_dl.sampler_iter)
+        for k, (cat, mask) in enumerate(zip(y_cat, y_mask.squeeze(1))):
+            if cat < thr_clf:
+                rle = '-1'
+            else:
+                mask = (mask>thr).float().numpy()
+                mask = cv2.resize(mask, (1024, 1024), interpolation=cv2.INTER_AREA)
+                mask = (mask>0.5).astype(np.uint8)*255
+                rle = mask2rle(mask.T, *mask.shape[-2:])
+            id = learner.data.test_ds.items[idxs[k]].with_suffix('').name
+            sub.loc[idxs[k]] = [id, rle]
+    sub.to_csv(path, index=False)
+    return sub
 ```
 
-```{python}
-# !kaggle competitions submit -c siim-acr-pneumothorax-segmentation -f ../submissions/$fn -m "resnet34 with new params for loss func and almost blank masks zeroed out"
+<!-- #region {"heading_collapsed": true, "Collapsed": "true"} -->
+## Param Find
+<!-- #endregion -->
+
+```{python hidden=TRUE, Collapsed=false}
+#sys.stdout = open('/dev/stdout', 'w')
 ```
 
-```{python}
+```{python hidden=TRUE, Collapsed=false}
+"""db = load_data(LABELS, bs=BATCH_SIZE, train_size=TRAIN_SIZE)
+k = 0
+for LR in [1e-5, 1e-4, 1e-3, 1e-2]:
+    for WD in [1e-4, 1e-3, 1e-2, 1e-1]:
+        for beta in [0.3, 0.4, 0.5, 0.6, 0.7]:
+            for loss_func in [BCELoss(beta=beta), BCEDiceLoss(beta=beta, smooth_num=False), BCEDiceLoss(beta=beta)]:
+                for weight_init in [0.5, 0.6, 0.7, 0.8]:
+                    weights = get_weights_sampler(db, beta=weight_init)
+
+                    learner = unet_learner(db, models[MODEL], pretrained=PRETRAINED,
+                                           loss_func=URLoss(loss_func),
+                                           wd=WD, model_dir=MODELS_PATH, metrics=[dice])
+
+                    sampler = RandomSampler(len(db.train_ds), weights=torch.tensor(weights))
+
+                    learner.data.train_dl = db.train_dl.new(shuffle=False, sampler=sampler)
+
+                    set_BN_momentum(learner.model)
+
+                    learner.fit_one_cycle(
+                        1, slice(LR), 
+                        callbacks=[AccumulateStep(learner, 64//BATCH_SIZE),
+                                   MonitorGrad(learner)])
+
+                    mean_grad = np.sum(np.absolute(learner.monitor_grad.grads[:50]))/50
+
+                    valid_preds, valid_gt = learner.get_preds(DatasetType.Valid, activ=torch.sigmoid)
+
+                    valid_preds[valid_preds.view(valid_preds.shape[0],-1).sum(-1) < 5e-3*TRAIN_SIZE**2,...] = 0.0
+
+                    thr = get_best_thr(valid_preds, valid_gt, plot=False)
+
+                    val_dice = dice_overall(valid_preds, valid_gt, thr=thr)
+                    
+                    add_loss = '1' if isinstance(loss_func, BCEDiceLoss) and loss_func.smooth_num else ''
+
+                    hypers = {'size': TRAIN_SIZE, 'lr': LR, 'wd': WD, 'bs': BATCH_SIZE,
+                              'loss': type(loss_func).__name__+add_loss, 'beta': beta,
+                              'weight_init': weight_init, 'thr': thr, 'mean_grad': mean_grad,
+                              'dice': val_dice.item()}
+                    print(k, hypers)
+                    k += 1
+                    hyper_csv(HYPERS_PATH, **hypers)"""
+```
+
+```{python hidden=TRUE, Collapsed=false}
+#hyper_df = pd.read_csv(HYPERS_PATH)
+#hyper_df.head()
+```
+
+<!-- #region {"Collapsed": "false"} -->
+## Training
+<!-- #endregion -->
+
+<!-- #region {"heading_collapsed": true, "Collapsed": "true"} -->
+### Frozen training
+<!-- #endregion -->
+
+```{python hidden=TRUE, Collapsed=false}
+db = load_data_softmax(LABELS, bs=BATCH_SIZE, train_size=TRAIN_SIZE)
+```
+
+```{python hidden=TRUE, Collapsed=false}
+db.show_batch(rows=3, cmap=plt.cm.bone)
+```
+
+```{python hidden=TRUE, Collapsed=false}
+clf_name = f'backbone_clf_{MODEL}'
+clf_name = f'{clf_name}_{getNextFilePath(MODELS_PATH, clf_name)-1}.pth'
+clf_name
+```
+
+```{python hidden=TRUE, Collapsed=false}
+save_name = f'seg_{MODEL}_{TRAIN_SIZE}'
+save_name = f'{save_name}_{getNextFilePath(MODELS_PATH, save_name)-1}'
+save_name
+```
+
+```{python hidden=TRUE, Collapsed=false}
+#sys.stdout = open('/dev/stdout', 'w')
+```
+
+```{python hidden=TRUE, Collapsed=false}
+learner = unet_learner(db, models[MODEL], pretrained=PRETRAINED,
+                       loss_func=URLoss(CrossEntropyFlat(axis=1)),
+                       wd=WD, model_dir=MODELS_PATH, metrics=[soft_dice])
+```
+
+```{python hidden=TRUE, Collapsed=false}
+weights = get_weights_sampler(db, beta=0.5)
+weights
+```
+
+```{python hidden=TRUE, Collapsed=false}
+sampler = RandomSampler(len(db.train_ds), weights=torch.tensor(weights))
+```
+
+```{python hidden=TRUE, Collapsed=false}
+learner.data.train_dl = db.train_dl.new(shuffle=False, sampler=sampler)
+```
+
+```{python hidden=TRUE, Collapsed=false}
+#next(learner.model.children())[0].load_state_dict(torch.load(MODELS_PATH/clf_name))
+```
+
+```{python hidden=TRUE, Collapsed=false}
+#learner = learner.to_fp16()
+```
+
+```{python hidden=TRUE, Collapsed=false}
+learner = learner.clip_grad(1.)
+```
+
+```{python hidden=TRUE, Collapsed=false}
+#learner = learner.load(save_name)
+```
+
+```{python hidden=TRUE, Collapsed=false}
+#learner.lr_find(num_it=1024//BATCH_SIZE)
+```
+
+```{python hidden=TRUE, Collapsed=false}
+#learner.recorder.plot()
+```
+
+```{python hidden=TRUE, Collapsed=false}
+LR = 1e-3
+```
+
+```{python hidden=TRUE, Collapsed=false}
+set_BN_momentum(learner.model)
+```
+
+```{python hidden=TRUE, Collapsed=false}
+date = datetime.datetime.now()
+```
+
+```{python hidden=TRUE, Collapsed=false}
+suff = f'_{date.day}-{date.month}-{date.year}_{date.hour}:{date.minute}:{date.second}'
+suff
+```
+
+```{python hidden=TRUE, Collapsed=false}
+#sys.stdout = open('/dev/stdout', 'w')
+```
+
+```{python hidden=TRUE, Collapsed=false}
+learner.fit_one_cycle(
+    50, slice(LR),
+    callbacks=[
+        SaveModelCallback(learner, monitor='valid_loss', name=save_name),
+        UpdateSamplerCallback(learner, do_update=False),
+        AccumulateStep(learner, 64//BATCH_SIZE),
+        LearnerTensorboardWriter(learner, LOG, save_name+suff, loss_iters=10,
+                                 hist_iters=100, stats_iters=10)])
+```
+
+```{python hidden=TRUE, Collapsed=false}
+#learner.save(save_name)
+```
+
+```{python hidden=TRUE, Collapsed=false}
+#weights = learner.update_sampler_callback.weights
+```
+
+```{python hidden=TRUE, Collapsed=false}
+#learner.recorder.plot_losses()
+```
+
+```{python hidden=TRUE, Collapsed=false}
+#learner.recorder.plot_metrics()
+```
+
+```{python hidden=TRUE, Collapsed=false}
+learner.show_results()
+```
+
+```{python hidden=TRUE, Collapsed=false}
+test_list = (PneumoSegmentationList.
+             from_folder(TEST_PATH, extensions=['.dcm']))
+learner.data.add_test(test_list, tfms=(), tfm_y=False)
+```
+
+```{python hidden=TRUE, Collapsed=false}
+#learner = learner.load(save_name)
+```
+
+```{python hidden=TRUE, Collapsed=false}
+thr = get_best_thr(learner); thr
+```
+
+```{python hidden=TRUE, Collapsed=false}
+fn = save_name+'.csv'
+```
+
+```{python hidden=TRUE, Collapsed=false}
+sub_df = create_submission(learner, SUB_PATH/fn, thr=thr)
+```
+
+```{python hidden=TRUE, Collapsed=false}
+# !kaggle competitions submit -c siim-acr-pneumothorax-segmentation -f ../submissions/$fn -m "Going vanilla with 2 classes and CE. 512px."
+```
+
+<!-- #region {"heading_collapsed": true, "Collapsed": "true"} -->
+### Unfrozen training
+<!-- #endregion -->
+
+```{python hidden=TRUE, Collapsed=false}
+#learner = unet_learner(db, models[MODEL], pretrained=PRETRAINED,
+#                       loss_func=URLoss(BCELoss(beta=0.7)),
+#                       wd=WD, model_dir=MODELS_PATH, metrics=[dice])
+```
+
+```{python hidden=TRUE, Collapsed=false}
+#sampler = RandomSampler(len(db.train_ds), weights=torch.tensor(weights))
+```
+
+```{python hidden=TRUE, Collapsed=false}
+#learner.data.train_dl = db.train_dl.new(shuffle=False, sampler=sampler)
+```
+
+```{python hidden=TRUE, Collapsed=false}
+#learner.load(save_name)
+```
+
+```{python hidden=TRUE, Collapsed=false}
 learner.unfreeze()
 ```
 
-```{python}
-learner.lr_find(num_it=200)
+```{python hidden=TRUE, Collapsed=false}
+#learner.lr_find(num_it=100)
 ```
 
-```{python}
-learner.recorder.plot(skip_end=1)
+```{python hidden=TRUE, Collapsed=false}
+#learner.recorder.plot(skip_end=1)
 ```
 
-```{python}
-LR = 5e-4
+```{python hidden=TRUE, Collapsed=false}
+LR = 1e-4
 ```
 
-```{python}
+```{python hidden=TRUE, Collapsed=false}
 uf_save_name = 'uf_'+save_name
 ```
 
-```{python}
+```{python hidden=TRUE, Collapsed=false}
+#sys.stdout = open('/dev/stdout', 'w')
+```
+
+```{python hidden=TRUE, Collapsed=false}
+#weights = [bce_loss(learner.model(x.data.unsqueeze(0).cuda()), y.data.unsqueeze(0).cuda(), beta=0.6).item() for x, y in learner.data.train_ds]
+```
+
+```{python hidden=TRUE, Collapsed=false}
+#learner.data.train_dl.sampler.weights = torch.tensor(weights)
+```
+
+```{python hidden=TRUE, Collapsed=false}
 learner.fit_one_cycle(
     20, slice(LR),
     callbacks=[
         SaveModelCallback(
-            learner, monitor='dice', name=uf_save_name),
-        UpdateSamplerCallback(learner),
-        AccumulateStep(learner, 64//BATCH_SIZE)])
+            learner, monitor='valid_loss', name=uf_save_name),
+        AccumulateStep(learner, 64//BATCH_SIZE),
+        LearnerTensorboardWriter(learner, LOG, uf_save_name, loss_iters=20,
+                                 hist_iters=100, stats_iters=50)])
 ```
 
-```{python}
-learner.recorder.plot_losses()
+```{python hidden=TRUE, Collapsed=false}
+#learner.save(uf_save_name)
 ```
 
-```{python}
-learner.recorder.plot_metrics()
+```{python hidden=TRUE, Collapsed=false}
+learner = learner.load(uf_save_name)
 ```
 
-```{python}
-learner.destroy()
-learner = unet_learner(db, models[MODEL], pretrained=PRETRAINED, loss_func=URLoss(BCEDiceLoss(a=0.5, b=0.5, beta=0.7, smooth=0.1)), wd=WD, model_dir=MODELS_PATH, metrics=[partial(dice, smooth=0.1)])
-learner.load(uf_save_name)
-learner = learner.to_fp16()
-```
-
-```{python}
+```{python hidden=TRUE, Collapsed=false}
 learner.show_results()
 ```
 
-```{python}
+```{python hidden=TRUE, Collapsed=false}
+test_list = (PneumoSegmentationList.
+             from_folder(TEST_PATH, extensions=['.dcm']))
+learner.data.add_test(test_list, tfms=(), tfm_y=False)
+```
+
+```{python hidden=TRUE, Collapsed=false}
+learner.data.label_list.test.tfmargs = {'size': TEST_SIZE}
+```
+
+```{python hidden=TRUE, Collapsed=false}
+thr = get_best_thr(learner)
+```
+
+```{python hidden=TRUE, Collapsed=false}
+fn = uf_save_name+'.csv'
+```
+
+```{python hidden=TRUE, Collapsed=false}
+sub_df = create_submission(learner, SUB_PATH/fn, thr=thr)
+```
+
+```{python hidden=TRUE, Collapsed=false}
+# !kaggle competitions submit -c siim-acr-pneumothorax-segmentation -f ../submissions/$fn -m "Going vanilla with 2 classes and CE. Trained on 512px and test on 1024px."
+```
+
+<!-- #region {"heading_collapsed": true, "Collapsed": "true"} -->
+### Final training on 1024*1024 images
+<!-- #endregion -->
+
+```{python hidden=TRUE, Collapsed=false}
+fin_save_name = 'fin_'+save_name
+```
+
+```{python hidden=TRUE, Collapsed=false}
+TRAIN_SIZE = 1024
+BATCH_SIZE = BATCH_SIZE//4
+```
+
+```{python hidden=TRUE, Collapsed=false}
+db = load_data(LABELS, bs=BATCH_SIZE, train_size=TRAIN_SIZE)
+```
+
+```{python hidden=TRUE, Collapsed=false}
+learner = unet_learner(db, models[MODEL], pretrained=PRETRAINED,
+                       loss_func=URLoss(BCELoss(beta=0.7)),
+                       wd=WD, model_dir=MODELS_PATH, metrics=[dice])
+```
+
+```{python hidden=TRUE, Collapsed=false}
+sampler = RandomSampler(len(db.train_ds), weights=torch.tensor(weights))
+```
+
+```{python hidden=TRUE, Collapsed=false}
+learner.data.train_dl = db.train_dl.new(shuffle=False, sampler=sampler)
+```
+
+```{python hidden=TRUE, Collapsed=false}
+learner.load(uf_save_name)
+```
+
+```{python hidden=TRUE, Collapsed=false}
+#learner.clip_grad(10.)
+```
+
+```{python hidden=TRUE, Collapsed=false}
+set_BN_momentum(learner.model)
+```
+
+```{python hidden=TRUE, Collapsed=false}
+learner.unfreeze()
+```
+
+```{python hidden=TRUE, Collapsed=false}
+learner.fit_one_cycle(
+    10, slice(LR/1e3, LR/50),
+    callbacks=[
+        SaveModelCallback(
+            learner, monitor='dice', name=fin_save_name),
+        UpdateSamplerCallback(learner),
+        AccumulateStep(learner, 64//BATCH_SIZE),
+        LearnerTensorboardWriter(learner, LOG, fin_save_name, loss_iters=10,
+                                 hist_iters=100, stats_iters=50)])
+```
+
+```{python hidden=TRUE, Collapsed=false}
+learner.load(fin_save_name)
+```
+
+```{python hidden=TRUE, Collapsed=false}
+learner.data.add_test(test_list, tfms=(), tfm_y=False)
+```
+
+```{python hidden=TRUE, Collapsed=false}
 preds, gt = learner.get_preds(DatasetType.Test)
 ```
 
-```{python}
-preds = torch.sigmoid(preds)
+```{python hidden=TRUE, Collapsed=false}
+if use_sigmoid: preds = torch.sigmoid(preds)
 ```
 
-```{python}
-preds[preds.view(preds.shape[0],-1).sum(-1) < 75.0*4,...] = 0.0
+```{python hidden=TRUE, Collapsed=false}
+preds[preds.view(preds.shape[0],-1).sum(-1) < 5e-3*TRAIN_SIZE**2,...] = 0.0
 ```
 
-```{python}
+```{python hidden=TRUE, Collapsed=false}
 valid_preds, valid_gt = learner.get_preds(DatasetType.Valid)
 ```
 
-```{python}
-valid_preds[valid_preds.view(valid_preds.shape[0],-1).sum(-1) < 75.0*4,...] = 0.0
+```{python hidden=TRUE, Collapsed=false}
+if use_sigmoid: valid_preds = torch.sigmoid(valid_preds)
 ```
 
-```{python}
+```{python hidden=TRUE, Collapsed=false}
+valid_preds[valid_preds.view(valid_preds.shape[0],-1).sum(-1) < 5e-3*TRAIN_SIZE**2,...] = 0.0
+```
+
+```{python hidden=TRUE, Collapsed=false}
 thr = get_best_thr(valid_preds, valid_gt)
 ```
 
-```{python}
-sub_df = create_submission(db, preds, SUB_PATH/(uf_save_name+'.csv'), thr=thr)
+```{python hidden=TRUE, Collapsed=false}
+fn = fin_save_name+'.csv'
 ```
 
-```{python}
-# !kaggle competitions submit -c siim-acr-pneumothorax-segmentation -f ../submissions/$(uf_save_name+'.csv') -m "test with resnet34 and zeroing small masks + unfrozen"
+```{python hidden=TRUE, Collapsed=false}
+sub_df = create_submission(db, preds, SUB_PATH/fn, thr=thr)
 ```
 
-## K-fold
+```{python hidden=TRUE, Collapsed=false}
+# !kaggle competitions submit -c siim-acr-pneumothorax-segmentation -f ../submissions/$fn -m "bce + new dice where smooth only on denom. "
+```
 
-```{python}
+<!-- #region {"heading_collapsed": true, "Collapsed": "true"} -->
+### K-fold
+<!-- #endregion -->
+
+```{python hidden=TRUE, Collapsed=false}
 def load_data_kfold(path, nfolds=5, bs=8, train_size=256):
     kf = KFold(n_splits=nfolds, shuffle=True)
     train_list = (PneumoSegmentationList.
@@ -1013,36 +1791,7 @@ def load_data_kfold(path, nfolds=5, bs=8, train_size=256):
         yield db
 ```
 
-```{python}
-best = 0
-for k, db in enumerate(load_data_kfold(LABELS_POS, bs=BATCH_SIZE, train_size=TRAIN_SIZE)):
-    print(f'fold {k}')
-    
-    learner = unet_learner(db, models[MODEL], pretrained=PRETRAINED,
-                           loss_func=URLoss(BCEDiceLoss(a=0.7, b=0.3)), wd=WD, model_dir=MODELS_PATH, metrics=[dice])
-    next(learner.model.children())[0].load_state_dict(torch.load(MODELS_PATH/clf_name))
-    learner = learner.to_fp16()
-    
-    fold_name = f'fold{k}_'+save_name
-    learner.fit_one_cycle(
-        20, slice(LR),
-        callbacks=[
-            SaveModelCallback(
-                learner, monitor='dice', name=fold_name),
-            UpdateSamplerCallback(learner),
-            AccumulateStep(learner, 64//BATCH_SIZE)])
-
-    learner.load(fold_name)
-    _, met = learner.validate()
-
-    if met > best:
-        learner.save(save_name)
-        best = met
-        print(f'New best fold {k} with dice {best}')
-print(best)
-```
-
-```{python}
+```{python hidden=TRUE, Collapsed=false}
 def predict_k_fold(db, save_name, test_path, nfolds=5, size=256):
     test_list = (PneumoSegmentationList.
                  from_folder(test_path, extensions=['.dcm']))
@@ -1071,11 +1820,40 @@ def predict_k_fold(db, save_name, test_path, nfolds=5, size=256):
     return sub_df, final_preds
 ```
 
-```{python}
+```{python hidden=TRUE, Collapsed=false}
+best = 0
+for k, db in enumerate(load_data_kfold(LABELS_POS, bs=BATCH_SIZE, train_size=TRAIN_SIZE)):
+    print(f'fold {k}')
+    
+    learner = unet_learner(db, models[MODEL], pretrained=PRETRAINED,
+                           loss_func=URLoss(BCEDiceLoss(a=0.7, b=0.3)), wd=WD, model_dir=MODELS_PATH, metrics=[dice])
+    next(learner.model.children())[0].load_state_dict(torch.load(MODELS_PATH/clf_name))
+    learner = learner.to_fp16()
+    
+    fold_name = f'fold{k}_'+save_name
+    learner.fit_one_cycle(
+        20, slice(LR),
+        callbacks=[
+            SaveModelCallback(
+                learner, monitor='dice', name=fold_name),
+            UpdateSamplerCallback(learner),
+            AccumulateStep(learner, 64//BATCH_SIZE)])
+
+    learner.load(fold_name)
+    _, met = learner.validate()
+
+    if met > best:
+        learner.save(save_name)
+        best = met
+        print(f'New best fold {k} with dice {best}')
+print(best)
+```
+
+```{python hidden=TRUE, Collapsed=false}
 sub_df, preds = predict_k_fold(learner.data, save_name, TEST_PATH, size=TRAIN_SIZE)
 ```
 
-```{python}
+```{python hidden=TRUE, Collapsed=false}
 test_list = (PneumoSegmentationList.
              from_folder(TEST_PATH, extensions=['.dcm']))
 db = learner.data
@@ -1083,137 +1861,223 @@ db.add_test(test_list, tfms=(), tfm_y=False)
 sub_df = create_submission(db, preds, SUB_PATH/('4_'+save_name+'.csv'), thr=0.9)
 ```
 
-```{python}
+```{python hidden=TRUE, Collapsed=false}
 fn = '4_'+save_name+'.csv'
 # !kaggle competitions submit -c siim-acr-pneumothorax-segmentation -f ../submissions/$fn -m "test with resnet34 and k-fold"
 ```
 
-# CLASSIF
+<!-- #region {"heading_collapsed": true, "Collapsed": "true"} -->
+### Classif
+<!-- #endregion -->
 
-```{python}
-db_clf, class_weights = load_data_classif(LABELS_CLASSIF, bs=BATCH_SIZE, train_size=TRAIN_SIZE, weight_sample=False)
+```{python hidden=TRUE, Collapsed=false}
+CLF_BS = 8*BATCH_SIZE
 ```
 
-```{python}
+```{python hidden=TRUE, Collapsed=false}
+db_clf = load_data_classif(LABELS_CLASSIF, bs=CLF_BS, train_size=TRAIN_SIZE)
+```
+
+```{python hidden=TRUE, Collapsed=false}
 clf = cnn_learner(db_clf, models[MODEL], pretrained=PRETRAINED,
-                  loss_func=URLoss(nn.CrossEntropyLoss()),
                   wd=WD, model_dir=MODELS_PATH, metrics=[accuracy])
 ```
 
-```{python}
-sampler = RandomSampler(len(db_clf.train_ds))
+```{python hidden=TRUE, Collapsed=false}
+#weights, class_weights = get_weights(db_clf.train_ds)
 ```
 
-```{python}
-clf.data.train_dl = db_clf.train_dl.new(shuffle=False, sampler=sampler)
+```{python hidden=TRUE, Collapsed=false}
+#sampler = RandomSampler(len(db_clf.train_ds), weights=torch.tensor(weights))
 ```
 
-```{python}
-db_clf.show_batch(cmap=plt.cm.bone)
+```{python hidden=TRUE, Collapsed=false}
+#clf.data.train_dl = db_clf.train_dl.new(shuffle=False, sampler=sampler)
 ```
 
-```{python}
+```{python hidden=TRUE, Collapsed=false}
+#db_clf.show_batch(cmap=plt.cm.bone)
+```
+
+```{python hidden=TRUE, Collapsed=false}
 #clf.load('clf_resnet152_0').to_fp16()
 ```
 
-```{python}
-clf = clf.to_fp16()
+```{python hidden=TRUE, Collapsed=false}
+#clf = clf.to_fp16()
 ```
 
-```{python}
-clf.unfreeze()
-```
-
-```{python}
-clf.lr_find(num_it=200)
-```
-
-```{python}
-clf.recorder.plot()
-```
-
-```{python}
-save_name = f'clf_{MODEL}'
+```{python hidden=TRUE, Collapsed=false}
+save_name = f'clf_{MODEL}_{TRAIN_SIZE}'
 save_name = f'{save_name}_{getNextFilePath(MODELS_PATH, save_name)}'
 save_name
 ```
 
-```{python}
+```{python hidden=TRUE, Collapsed=false}
 set_BN_momentum(clf.model)
 ```
 
-```{python}
+```{python hidden=TRUE, Collapsed=false}
+clf = clf.clip_grad(1.)
+```
+
+```{python hidden=TRUE, Collapsed=false}
+#clf.lr_find()
+```
+
+```{python hidden=TRUE, Collapsed=false}
+#clf.recorder.plot()
+```
+
+```{python hidden=TRUE, Collapsed=false}
 clf.fit_one_cycle(
-    10, slice(2e-4),
+    20, slice(1e-3),
     callbacks=[
         SaveModelCallback(
-            clf, monitor='accuracy', name=save_name),
-        UpdateSamplerCallback(clf),
-        AccumulateStep(clf, 64//BATCH_SIZE)])
+            clf, monitor='valid_loss', name=save_name),
+        AccumulateStep(clf, 64//CLF_BS),
+        LearnerTensorboardWriter(clf, LOG, save_name, loss_iters=5,
+                             hist_iters=25, stats_iters=5)])
 ```
 
-```{python}
-w = clf.data.train_dl.sampler.weights.detach().numpy()
-n, bins, patches = plt.hist(x=w, bins='auto', color='#0504aa',
-                            alpha=0.7, rwidth=0.85)
-maxfreq = n.max()
-# Set a clean upper y-axis limit.
-plt.ylim(top=np.ceil(maxfreq / 10) * 10 if maxfreq % 10 else maxfreq + 10)
+```{python hidden=TRUE, Collapsed=false}
+clf.load(save_name)
 ```
 
-```{python}
-clf.recorder.plot_losses()
+```{python hidden=TRUE, Collapsed=false}
+clf_thr = get_best_thr_clf(clf)
 ```
 
-```{python}
-clf.recorder.plot_metrics()
+```{python hidden=TRUE, Collapsed=false}
+test_list = (PneumoClassifList.
+             from_folder(TEST_PATH, extensions=['.dcm']))
+clf.data.add_test(test_list, tfms=(), tfm_y=False)
 ```
 
-```{python}
+```{python hidden=TRUE, Collapsed=false}
+preds, gt = clf.get_preds(DatasetType.Test)
+preds = preds[:, 1]
+```
+
+```{python hidden=TRUE, Collapsed=false}
+idxs = (preds<=clf_thr).nonzero()
+ids = test_list.items[idxs].squeeze()
+```
+
+```{python hidden=TRUE, Collapsed=false}
+test_list = (PneumoSegmentationList.
+             from_folder(TEST_PATH, extensions=['.dcm']).
+             filter_by_func(lambda fn: fn not in ids))
+learner.data.add_test(test_list, tfms=(), tfm_y=False)
+```
+
+```{python hidden=TRUE, Collapsed=false}
+fn = save_name+'.csv'
+```
+
+```{python hidden=TRUE, Collapsed=false}
+#thr = get_best_thr(learner)
+```
+
+```{python hidden=TRUE, Collapsed=false}
+sub_df = create_submission_with_clf(learner, SUB_PATH/fn, ids, thr=thr)
+```
+
+```{python hidden=TRUE, Collapsed=false}
+# !kaggle competitions submit -c siim-acr-pneumothorax-segmentation -f ../submissions/$fn -m "Using classifier to filter before unet at test time."
+```
+
+```{python hidden=TRUE, Collapsed=false}
 clf.unfreeze()
 ```
 
-```{python}
+```{python hidden=TRUE, Collapsed=false}
+#clf.lr_find(start_lr=slice(1e-7), end_lr=slice(10))
+```
+
+```{python hidden=TRUE, Collapsed=false}
+#clf.recorder.plot()
+```
+
+```{python hidden=TRUE, Collapsed=false}
+uf_save_name = 'uf_'+save_name
+```
+
+```{python hidden=TRUE, Collapsed=false}
 clf.fit_one_cycle(
-    10, slice(LR/100, LR/5),
+    50, slice(1e-4),
     callbacks=[
         SaveModelCallback(
-            clf, monitor='accuracy', name='clf_resnet34_0')])
+            clf, monitor='valid_loss', name=uf_save_name),
+        AccumulateStep(clf, 64//CLF_BS),
+        LearnerTensorboardWriter(clf, LOG, uf_save_name, loss_iters=5,
+                             hist_iters=25, stats_iters=5)])
 ```
 
-```{python}
-clf.recorder.plot_losses()
+```{python hidden=TRUE, Collapsed=false}
+clf_thr = get_best_thr_clf(clf)
 ```
 
-```{python}
-clf.recorder.plot_metrics()
+```{python hidden=TRUE, Collapsed=false}
+test_list = (PneumoClassifList.
+             from_folder(TEST_PATH, extensions=['.dcm']))
+clf.data.add_test(test_list, tfms=(), tfm_y=False)
 ```
 
-```{python}
-clf.show_results()
+```{python hidden=TRUE, Collapsed=false}
+preds, gt = clf.get_preds(DatasetType.Test)
+preds = preds[:, 1]
 ```
 
-```{python}
+```{python hidden=TRUE, Collapsed=false}
+idxs = (preds<=clf_thr).nonzero()
+ids = test_list.items[idxs].squeeze()
+```
+
+```{python hidden=TRUE, Collapsed=false}
+test_list = (PneumoSegmentationList.
+             from_folder(TEST_PATH, extensions=['.dcm']).
+             filter_by_func(lambda fn: fn not in ids))
+learner.data.add_test(test_list, tfms=(), tfm_y=False)
+```
+
+```{python hidden=TRUE, Collapsed=false}
+#thr = get_best_thr(learner)
+```
+
+```{python hidden=TRUE, Collapsed=false}
+fn = uf_save_name+'.csv'
+```
+
+```{python hidden=TRUE, Collapsed=false}
+sub_df = create_submission_with_clf(learner, SUB_PATH/fn, ids, thr=thr)
+```
+
+```{python hidden=TRUE, Collapsed=false}
+# !kaggle competitions submit -c siim-acr-pneumothorax-segmentation -f ../submissions/$fn -m "Using classifier to filter before unet at test time. 512px."
+```
+
+```{python hidden=TRUE, Collapsed=false}
 interp = clf.interpret()
 ```
 
-```{python}
+```{python hidden=TRUE, Collapsed=false}
 interp.plot_confusion_matrix()
 ```
 
-```{python}
+```{python hidden=TRUE, Collapsed=false}
 interp.plot_top_losses(9, heatmap=False)
 ```
 
-```{python}
+```{python hidden=TRUE, Collapsed=false}
 torch.save(next(clf.model.children()).state_dict(), MODELS_PATH/f'backbone_{save_name}.pth')
 ```
 
-```{python}
+```{python hidden=TRUE, Collapsed=false}
 clf.destroy()
 ```
 
-```{python}
+```{python hidden=TRUE, Collapsed=false}
 df = pd.read_csv(LABELS_CLASSIF)
 stats = pd.DataFrame(columns=['ImageId', 'Age', 'Sex', 'Height', 'Width', 'Pneumo'])
 for row in tqdm(df.itertuples(), total=df.shape[0]):
@@ -1223,51 +2087,51 @@ for row in tqdm(df.itertuples(), total=df.shape[0]):
     stats.loc[row.Index] = [row.ImageId, int(ds.PatientAge), ds.PatientSex, h, w, int(row.Labels)]
 ```
 
-```{python}
+```{python hidden=TRUE, Collapsed=false}
 stats.head()
 ```
 
-```{python}
+```{python hidden=TRUE, Collapsed=false}
 stats.loc[stats['Sex']=='F'].shape[0]
 ```
 
-```{python}
+```{python hidden=TRUE, Collapsed=false}
 stats.loc[stats['Sex']=='M'].shape[0]
 ```
 
-```{python}
+```{python hidden=TRUE, Collapsed=false}
 stats_age = stats.groupby(pd.cut(stats['Age'], list(range(0, 101, 10))+[450]))
 ```
 
-```{python}
+```{python hidden=TRUE, Collapsed=false}
 stats_age.count()['Pneumo']
 ```
 
-```{python}
+```{python hidden=TRUE, Collapsed=false}
 stats_age.sum()['Pneumo']/stats_age.count()['Pneumo']
 ```
 
-```{python}
+```{python hidden=TRUE, Collapsed=false}
 stats_sex = stats.groupby('Sex')
 ```
 
-```{python}
+```{python hidden=TRUE, Collapsed=false}
 stats_sex.count()['Pneumo']
 ```
 
-```{python}
+```{python hidden=TRUE, Collapsed=false}
 stats_sex.sum()['Pneumo']/stats_sex.count()['Pneumo']
 ```
 
-```{python}
+```{python hidden=TRUE, Collapsed=false}
 losses, idxs = interp.top_losses()
 ```
 
-```{python}
+```{python hidden=TRUE, Collapsed=false}
 idxs = idxs.numpy()
 ```
 
-```{python}
+```{python hidden=TRUE, Collapsed=false}
 ids = []
 for i, l in zip(idxs, losses):
     if l.item()<0.2:
@@ -1277,31 +2141,31 @@ for i, l in zip(idxs, losses):
     ids.append(str(id))
 ```
 
-```{python}
+```{python hidden=TRUE, Collapsed=false}
 top_losses = stats.loc[stats['ImageId'].isin(ids)]
 ```
 
-```{python}
+```{python hidden=TRUE, Collapsed=false}
 top_losses.head()
 ```
 
-```{python}
+```{python hidden=TRUE, Collapsed=false}
 top_losses.groupby('Pneumo').count().head()['ImageId']
 ```
 
-```{python}
+```{python hidden=TRUE, Collapsed=false}
 top_losses.groupby('Sex').count().head()['ImageId']/stats_sex.count()['Pneumo']
 ```
 
-```{python}
+```{python hidden=TRUE, Collapsed=false}
 top_losses.groupby(pd.cut(top_losses['Age'], list(range(0, 101, 10))+[450])).count().head()['ImageId']/stats_age.count()['Pneumo']
 ```
 
-```{python}
+```{python hidden=TRUE, Collapsed=false}
 dl = clf.data.train_dl
 ```
 
-```{python}
+```{python hidden=TRUE, Collapsed=false}
 from itertools import tee
 def new_iter(self):
     dl = iter(self.dl)
@@ -1310,12 +2174,12 @@ def new_iter(self):
         yield self.proc_batch(b)
 ```
 
-```{python}
+```{python hidden=TRUE, Collapsed=false}
 from fastai.basic_data import DeviceDataLoader
 DeviceDataLoader.__iter__= new_iter
 ```
 
-```{python}
+```{python hidden=TRUE, Collapsed=false}
 idxs = []
 xs = []
 for x in tqdm(dl, total=len(dl)):
@@ -1323,19 +2187,206 @@ for x in tqdm(dl, total=len(dl)):
     xs.append(x)
 ```
 
-```{python}
+```{python hidden=TRUE, Collapsed=false}
 clf.data.train_ds[idxs[2][0]][0]
 ```
 
-```{python}
+```{python hidden=TRUE, Collapsed=false}
 x = xs[2][0][0].float()
 Image((x-torch.min(x))/(torch.max(x)-torch.min(x)))
 ```
 
-```{python}
-next(iter(dl))
+<!-- #region {"Collapsed": "false"} -->
+### MultiTask Learning
+<!-- #endregion -->
+
+```{python Collapsed=false}
+db = load_data_mtl(LABELS, bs=BATCH_SIZE, train_size=TRAIN_SIZE)
 ```
 
-```{python}
+```{python Collapsed=false}
+#db.show_batch()
+```
+
+```{python Collapsed=false}
+seg_loss = DiceLoss()
+```
+
+```{python Collapsed=false}
+learner = multi_task_unet_learner(db, models[MODEL], pretrained=PRETRAINED,
+                       loss_func=MTLLoss(CrossEntropyFlat(), CrossEntropyFlat(axis=1)),
+                       wd=WD, model_dir=MODELS_PATH, metrics=[mtl_metric(dice, dim=1),
+                                                              mtl_metric(accuracy, dim=0),
+                                                              average_mtl_metric([dice, accuracy], [1, 0])])
+```
+
+```{python Collapsed=false}
+save_name = f'mtl_{MODEL}_{TRAIN_SIZE}'
+save_name = f'{save_name}_{getNextFilePath(MODELS_PATH, save_name)-3}'
+save_name
+```
+
+```{python Collapsed=false}
+prev_save_name = f'mtl_{MODEL}_{512}'
+prev_save_name = f'{prev_save_name}_{getNextFilePath(MODELS_PATH, prev_save_name)-1}'
+prev_save_name = 'uf_fold2_mtl_resnet34_256_2'
+prev_save_name
+```
+
+```{python Collapsed=false}
+learner.load(prev_save_name)
+```
+
+```{python Collapsed=false}
+learner.model.log_vars.val
+```
+
+```{python Collapsed=false, jupyter={'outputs_hidden': True}}
+learner.show_results(rows=10)
+```
+
+```{python Collapsed=false}
+#learner = learner.clip_grad(1.)
+```
+
+```{python Collapsed=false}
+set_BN_momentum(learner.model)
+```
+
+```{python Collapsed=false}
+#learner.lr_find(num_it=1024//BATCH_SIZE)
+```
+
+```{python Collapsed=false}
+#learner.recorder.plot()
+```
+
+```{python Collapsed=false}
+LR = 1e-5
+```
+
+```{python Collapsed=false}
+date = datetime.datetime.now()
+```
+
+```{python Collapsed=false}
+suff = f'_{date.day}-{date.month}-{date.year}_{date.hour}:{date.minute}:{date.second}'
+suff
+```
+
+```{python Collapsed=false}
+#sys.stdout = open('/dev/stdout', 'w')
+```
+
+```{python Collapsed=false}
+project = neptune.init('schwobr/SIIM-Pneumothorax')
+```
+
+```{python Collapsed=false}
+learner.fit_one_cycle(
+    1, slice(LR), wd=1e-4,
+    callbacks=[
+        SaveModelCallback(learner, monitor='dice', name=save_name),
+        MTLLossCallback(learner),
+        AccumulateStep(learner, 64//BATCH_SIZE),
+        NeptuneCallback(learner, project, name=save_name, params={'lr': LR, 'wd': WD, 'size':TRAIN_SIZE}),
+        LearnerTensorboardWriter(learner, LOG, save_name+suff, loss_iters=10,
+                                 hist_iters=50, stats_iters=10)])
+```
+
+```{python Collapsed=false}
+learner.unfreeze()
+```
+
+```{python Collapsed=false}
+uf_save_name = 'uf_'+save_name
+```
+
+```{python Collapsed=false}
+LR = 5e-5
+```
+
+```{python Collapsed=false}
+learner.fit_one_cycle(
+    20, slice(LR/100, LR), wd=1e-4,
+    callbacks=[
+        SaveModelCallback(learner, monitor='dice', name=uf_save_name),
+        MTLLossCallback(learner),
+        AccumulateStep(learner, 64//BATCH_SIZE),
+        NeptuneCallback(learner, project, name=save_name, params={'lr': LR, 'wd': WD, 'size':TRAIN_SIZE})
+        LearnerTensorboardWriter(learner, LOG, uf_save_name, loss_iters=10,
+                                 hist_iters=50, stats_iters=10)])
+```
+
+```{python Collapsed=false, jupyter={'outputs_hidden': True}}
+learner.load(uf_save_name)
+```
+
+```{python Collapsed=false}
+learner.show_results(ds_type=2, rows=20)
+```
+
+```{python Collapsed=false}
+test_list = (MultiTaskList.
+             from_folder(TEST_PATH, extensions=['.dcm']))
+learner.data.add_test(test_list, label=[test_list.items[0], '-1'], tfms=(), tfm_y=True)
+```
+
+```{python Collapsed=false}
+#learner.data.label_list.test.tfmargs = {'size': TEST_SIZE}
+```
+
+```{python Collapsed=false}
+thr, thr_clf = get_best_thrs_mtl(learner, a=0.)
+```
+
+```{python Collapsed=false}
+fn = '11_'+uf_save_name+'.csv'
+```
+
+```{python Collapsed=false}
+sub_df = create_submission_mtl(learner, SUB_PATH/fn, thr=thr, thr_clf=0.)
+```
+
+```{python Collapsed=false}
+sub_df.loc[sub_df['EncodedPixels'] != '-1'].shape
+```
+
+```{python Collapsed=false}
+# !kaggle competitions submit -c siim-acr-pneumothorax-segmentation -f ../submissions/$fn -m "Thresholding before resize. No clf thr. Higher threshold to delete small masks"
+```
+
+```{python Collapsed=false}
+df1 = pd.read_csv(SUB_PATH/fn)
+df2 = pd.read_csv(SUB_PATH/'4_uf_mtl_resnet34_256_1.csv')
+df3 = pd.read_csv(SUB_PATH/'uf_clf_resnet34_512_1.csv')
+```
+
+```{python Collapsed=false}
+df = df1.append(df2, ignore_index=True)
+```
+
+```{python Collapsed=false}
+df = df.append(df3, ignore_index=True)
+```
+
+```{python Collapsed=false}
+merge_doubles(SUB_PATH/'merge_test.csv', SUB_PATH/'merge_test.csv')
+```
+
+```{python Collapsed=false}
+def show_preds(csv_path, test_path, idxs, bs=8):
+    df = pd.read_csv(csv_path)
+    df.to_csv(test_path/csv_path.name, index=False)
+    db = (PneumoSegmentationList.
+                 from_csv(test_path, csv_path.name).
+                 split_none().
+                 label_from_df(cols=[0, 1], classes=['bg', 'pneum'], label_cls=SoftmaxMaskList, train_path=test_path).
+                 databunch(bs=bs, num_workers=0))
+    db.show_batch(rows=bs)
+    return db
+```
+
+```{python Collapsed=false}
 
 ```

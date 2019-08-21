@@ -126,5 +126,3 @@ dmypy.json
 # vscode
 .vscode/
 
-# models
-*.pth

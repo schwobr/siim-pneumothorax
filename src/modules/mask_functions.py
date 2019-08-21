@@ -2,6 +2,16 @@ import numpy as np
 
 
 def mask2rle(img, width, height):
+    """
+    Used to convert mask into run-length encoded string (column-first)
+    with relative values.
+
+    img: transposed version of the mask to encode
+    width: width of the mask
+    height: height of the mask
+
+    return: rle string corresponding to the mask
+    """
     rle = []
     lastColor = 0
     currentPixel = 0
@@ -26,10 +36,20 @@ def mask2rle(img, width, height):
             lastColor = currentColor
             currentPixel += 1
 
-    return " ".join(rle)
+    return " ".join(rle) if rle != [] else '-1'
 
 
 def rle2mask(rle, width, height):
+    """
+    Converts run-length encoded string with relative values
+    (column-first) to corresponding mask
+
+    rle: run-length encoded string
+    width: width of the mask image
+    height: height of the mask image
+
+    return: corresponding mask
+    """
     if rle == '-1':
         return np.zeros((width, height))
     mask = np.zeros(width * height)
@@ -47,6 +67,14 @@ def rle2mask(rle, width, height):
 
 
 def absol2relat(rle):
+    """
+    Converts a run-length encoded string with absolute values
+    to one with relative values
+
+    rle: rle string with absolute values
+
+    return: rle string with relative values
+    """
     if rle == '-1':
         return '-1'
     pixels = rle.split()
@@ -65,6 +93,14 @@ def absol2relat(rle):
 
 
 def relat2absol(rle):
+    """
+    Converts a run-length encoded string with relative values
+    to one with absolute values
+
+    rle: rle string with relative values
+
+    return: rle string with absolute values
+    """
     if rle == '-1':
         return '-1'
     pixels = rle.split()
@@ -81,6 +117,14 @@ def relat2absol(rle):
 
 
 def merge_rles(rle1, rle2):
+    """
+    Merges 2 absolute run-length encoded strings
+
+    rle1: first rle string
+    rle2: second rle string
+
+    return: New rle corresponding to the merge of the inputs
+    """
     if rle1 == rle2:
         return rle1
     i1 = 0

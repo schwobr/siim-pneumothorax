@@ -1,14 +1,17 @@
-import torch
 import torchvision.models as mod
 
 from fastai.vision.learner import unet_learner
 from fastai.callbacks import SaveModelCallback
+from fastai.callbacks.tensorboard import LearnerTensorboardWriter
+from fastai.layers import CrossEntropyFlat
 
 import config as cfg
-from modules.dataset import load_data
+from modules.dataset import load_data_softmax
 from modules.files import getNextFilePath
-from modules.metrics import dice
-from modules.losses import BCEDiceLoss
+from modules.metrics import soft_dice
+from modules.losses import URLoss
+from modules.callbacks import AccumulateStep
+from modules.models import set_BN_momentum
 
 
 def run():
@@ -16,49 +19,40 @@ def run():
         'resnet34': mod.resnet34, 'resnet50': mod.resnet50,
         'resnet101': mod.resnet101, 'resnet152': mod.resnet152}
 
-    db = load_data(cfg.LABELS_POS, bs=cfg.BATCH_SIZE,
-                   train_size=cfg.TRAIN_SIZE)
+    db = load_data_softmax(cfg.LABELS, bs=cfg.BATCH_SIZE,
+                           train_size=cfg.TRAIN_SIZE)
 
     learner = unet_learner(
         db, models[cfg.MODEL],
-        pretrained=cfg.PRETRAINED, loss_func=BCEDiceLoss(a=0.8, b=0.2),
-        wd=cfg.WD, model_dir=cfg.MODELS_PATH, metrics=[dice])
-
-    clf_name = f'backbone_clf_{cfg.MODEL}'
-    clf_name = f'{clf_name}_{getNextFilePath(cfg.MODELS_PATH, clf_name)-1}.pth'
-
-    next(learner.model.children())[0].load_state_dict(
-        torch.load(cfg.MODELS_PATH/clf_name))
-
-    learner = learner.to_fp16()
+        pretrained=cfg.PRETRAINED,
+        loss_func=URLoss(CrossEntropyFlat(axis=1)),
+        wd=cfg.WD, model_dir=cfg.MODELS_PATH, metrics=[soft_dice])
 
     save_name = f'seg_{cfg.MODEL}'
     save_name = f'{save_name}_{getNextFilePath(cfg.MODELS_PATH, save_name)}'
+
+    learner = learner.clip_grad(1.)
+    set_BN_momentum(learner.model)
 
     learner.fit_one_cycle(
         cfg.EPOCHS, slice(cfg.LR),
         callbacks=[
             SaveModelCallback(
-                learner, monitor='dice', name=save_name)])
-
-    fig = learner.recorder.plot_losses(return_fig=True)
-    fig.savefig(cfg.FIGS_PATH/f'loss_frozen_{save_name}.png')
-
-    fig = learner.recorder.plot_metrics(return_fig=True)
-    fig.savefig(cfg.FIGS_PATH/f'dice_frozen_{save_name}.png')
+                learner, monitor='valid_loss', name=save_name),
+            AccumulateStep(learner, 64 // cfg.BATCH_SIZE),
+            LearnerTensorboardWriter(
+                learner, cfg.LOG, save_name, loss_iters=10,
+                hist_iters=100, stats_iters=10)])
 
     learner.unfreeze()
+    uf_save_name = 'uf_'+save_name
 
     learner.fit_one_cycle(
-        cfg.UNFROZE_EPOCHS, slice(cfg.LR/100, cfg.LR/5),
+        cfg.EPOCHS, slice(cfg.LR/10),
         callbacks=[
             SaveModelCallback(
-                learner, monitor='dice', name=save_name)])
-
-    fig = learner.recorder.plot_losses(return_fig=True)
-    fig.savefig(cfg.FIGS_PATH/f'loss_unfrozen_{save_name}.png')
-
-    fig = learner.recorder.plot_metrics(return_fig=True)
-    fig.savefig(cfg.FIGS_PATH/f'dice_unfrozen_{save_name}.png')
-
-    learner.destroy()
+                learner, monitor='valid_loss', name=uf_save_name),
+            AccumulateStep(learner, 64 // cfg.BATCH_SIZE),
+            LearnerTensorboardWriter(
+                learner, cfg.LOG, uf_save_name, loss_iters=10,
+                hist_iters=100, stats_iters=10)])
