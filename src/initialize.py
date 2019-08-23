@@ -1,6 +1,8 @@
 import config as cfg
 from modules.files import (change_csv, merge_doubles, create_train,
                            create_classif_csv, restruct)
+import torch
+import numpy as np
 
 
 def run():
@@ -27,3 +29,8 @@ def run():
 
     if not cfg.LABELS_CLASSIF.is_file():
         create_classif_csv(cfg.LABELS, cfg.LABELS_CLASSIF)
+
+    torch.manual_seed(cfg.SEED)
+    np.random.seed(cfg.SEED)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False

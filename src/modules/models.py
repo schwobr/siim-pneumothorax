@@ -3,6 +3,7 @@ import torch
 from fastai.vision.learner import unet_learner, cnn_learner
 from fastai.callbacks.hooks import hook_outputs
 from fastai.layers import flatten_model, ParameterModule
+from fastai.torch_core import to_device
 
 
 def set_BN_momentum(model, momentum=0.05):
@@ -114,3 +115,26 @@ def multi_task_unet_learner(*args, log_vars=None, **kwargs):
     unet_learn.layer_groups = lg
     unet_learn.create_opt(slice(1e-3))
     return unet_learn
+
+
+def replace_bn(learner, m, G=32):
+    for n, ch in m.named_children():
+        if isinstance(ch, nn.BatchNorm2d):
+            new_layer = to_device(
+                nn.GroupNorm(G, ch.num_features, ch.eps, ch.affine),
+                learner.data.device)
+            m._modules[n] = new_layer
+            found = False
+            for lg in learner.layer_groups:
+                for k, c in lg.named_children():
+                    if c is ch:
+                        lg._modules[k] = new_layer
+                        found = True
+                        break
+                if found:
+                    break
+    for ch in m.children():
+        replace_bn(learner, ch)
+
+    if hasattr(learner, 'opt'):
+        learner.create_opt(learner.opt.lr, wd=learner.wd)

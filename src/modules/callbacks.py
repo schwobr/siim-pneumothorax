@@ -1,7 +1,7 @@
 from itertools import tee
 import torch
 from fastai.basic_data import DeviceDataLoader
-from fastai.basic_train import Learner
+# from fastai.basic_train import Learner
 from fastai.callback import OptimWrapper
 from fastai.callbacks import LearnerCallback
 from dataclasses import dataclass
@@ -68,7 +68,7 @@ def acc_create_opt(self, lr, wd=0.):
         true_wd=self.true_wd, bn_wd=self.bn_wd)
 
 
-Learner.create_opt = acc_create_opt
+# Learner.create_opt = acc_create_opt
 
 
 @dataclass
@@ -115,6 +115,7 @@ class MonitorGrad(LearnerCallback):
     """
     Callback used to monitor gradients
     """
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.grads = []
@@ -176,6 +177,7 @@ class NeptuneCallback(LearnerCallback):
 
     def on_epoch_end(self, last_metrics, epoch, **kwargs):
         metric_names = [met.__name__ for met in self.learn.metrics]
+        self.exp.send_metric('valid_loss', epoch, last_metrics[0])
         for m, v in zip(metric_names, last_metrics[1:]):
             self.exp.send_metric(m, epoch, v)
 
@@ -184,3 +186,15 @@ class NeptuneCallback(LearnerCallback):
 
     def send_artifact(self, *args, **kwargs):
         self.exp.send_artifact(*args, **kwargs)
+
+
+class LookAhead(LearnerCallback):
+    def __init__(self, *args, k=6, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.k = k
+
+    def on_step_end(self, iteration, **kwargs):
+        if iteration == 0:
+            return
+        if iteration % self.k == 0:
+            self.learn.opt.look_ahead()

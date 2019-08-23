@@ -18,6 +18,7 @@ class PneumoSegmentationList(SegmentationItemList):
     """
     SegmentationItemList that opens dicom image and converts it to 3-channel
     """
+
     def open(self, fn):
         """
         fn: path to the image file
@@ -44,6 +45,7 @@ class MaskList(SegmentationLabelList):
     SegmentationLabelList that creates mask from rle and returns
     an ImageSegmentFloat. Should be used with sigmoid activation.
     """
+
     def __init__(self, *args, train_path=None, **kwargs):
         """
         train_path: relative path to the train folder from ItemList folder
@@ -93,6 +95,7 @@ class SoftmaxMaskList(SegmentationLabelList):
     SegmentationLabelList that creates mask from rle and returns
     an ImageSegment. Should be used with softmax activation.
     """
+
     def __init__(self, *args, train_path=None, **kwargs):
         """
         train_path: relative path to the train folder from ItemList folder
@@ -122,6 +125,7 @@ class PneumoClassifList(ImageList):
     Basically the same as PneumoSegmentationList but for classification,
     created for clarity
     """
+
     def open(self, fn):
         """
         fn: path to the image file
@@ -138,6 +142,7 @@ class MultiTaskLabel(ItemBase):
     """
     ItemBase used for multi-task learning (clssification+segmentation)
     """
+
     def __init__(self, cat, mask):
         """
         cat: Category object classifying the image
@@ -179,6 +184,7 @@ class MultiTaskProcessor(PreProcessor):
     PreProcessor used for MultiTaskLabelList.
     Does basically the same as MultiCategoryProcessor.
     """
+
     def __init__(self, ds):
         self.create_classes(ds.classes)
         self.state_attrs, self.warns = ['classes'], []
@@ -335,13 +341,14 @@ def get_weights_sampler(db, beta=0.8):
     return weights
 
 
-def load_data(path, bs=8, train_size=256):
+def load_data(path, bs=8, train_size=256, xtra_tfms=None, **db_kwargs):
     """
     Create databunch for segmentation task with sigmoid activation
 
     path: path to the csv linking image paths to run-length encoded masks
     bs: batch size
     train_size: size to which image are to be resized
+    xtra_tfms: additional transforms to basic fastai ones
 
     return: databunch with train and validation datasets
     """
@@ -353,19 +360,22 @@ def load_data(path, bs=8, train_size=256):
                       classes=['pneum'],
                       label_cls=MaskList, train_path=path.parent).
                   transform(
-                      get_transforms(),
-                      size=train_size, tfm_y=True).databunch(
-                      bs=bs, num_workers=0).normalize(imagenet_stats))
+                      get_transforms(do_flip=False, xtra_tfms=xtra_tfms),
+                      size=train_size, tfm_y=True).
+                  databunch(bs=bs, num_workers=0, **db_kwargs).
+                  normalize(imagenet_stats))
     return train_list
 
 
-def load_data_softmax(path, bs=8, train_size=256):
+def load_data_softmax(
+        path, bs=8, train_size=256, xtra_tfms=None, **db_kwargs):
     """
     Create databunch for segmentation task with softmax activation
 
     path: path to the csv linking image paths to run-length encoded masks
     bs: batch size
     train_size: size to which image are to be resized
+    xtra_tfms: additional transforms to basic fastai ones
 
     return: databunch with train and validation datasets
     """
@@ -378,19 +388,22 @@ def load_data_softmax(path, bs=8, train_size=256):
             classes=['bg', 'pneum'],
             label_cls=SoftmaxMaskList, train_path=path.parent).
         transform(
-            get_transforms(do_flip=False),
-            size=train_size, tfm_y=True).databunch(
-            bs=bs, num_workers=0).normalize(imagenet_stats))
+            get_transforms(do_flip=False, xtra_tfms=xtra_tfms),
+            size=train_size, tfm_y=True).
+        databunch(bs=bs, num_workers=0, **db_kwargs).
+        normalize(imagenet_stats))
     return train_list
 
 
-def load_data_classif(path, bs=8, train_size=256):
+def load_data_classif(
+        path, bs=8, train_size=256, xtra_tfms=None, **db_kwargs):
     """
     Create databunch for classification task
 
     path: path to the csv linking image paths to labels
     bs: batch size
     train_size: size to which image are to be resized
+    xtra_tfms: additional transforms to basic fastai ones
 
     return: databunch with train and validation datasets
     """
@@ -398,19 +411,21 @@ def load_data_classif(path, bs=8, train_size=256):
                   from_csv(path.parent, path.name).
                   split_by_rand_pct(valid_pct=0.2).
                   label_from_df().
-                  transform(get_transforms(), size=train_size).
-                  databunch(bs=bs, num_workers=0).
+                  transform(get_transforms(do_flip=False, xtra_tfms=xtra_tfms),
+                            size=train_size).
+                  databunch(bs=bs, num_workers=0, **db_kwargs).
                   normalize(imagenet_stats))
     return train_list
 
 
-def load_data_mtl(path, bs=8, train_size=256):
+def load_data_mtl(path, bs=8, train_size=256, xtra_tfms=None, **db_kwargs):
     """
     Create databunch for multi-task learning (classification+segmentation)
 
     path: path to the csv linking image paths to run-length encoded masks
     bs: batch size
     train_size: size to which image are to be resized
+    xtra_tfms: additional transforms to basic fastai ones
 
     return: databunch with train and validation datasets
     """
@@ -422,14 +437,49 @@ def load_data_mtl(path, bs=8, train_size=256):
             classes=['bg', 'pneum'],
             label_cls=MultiTaskLabelList, train_path=path.parent).
         transform(
-            get_transforms(do_flip=False),
+            get_transforms(do_flip=False, xtra_tfms=xtra_tfms),
             size=train_size, tfm_y=True).
         databunch(
-            bs=bs, num_workers=0))
+            bs=bs, num_workers=0, **db_kwargs).
+        normalize(imagenet_stats))
     return train_list
 
 
-def load_data_kfold_mtl(path, nfolds=5, bs=8, train_size=256):
+def load_data_kfold(
+        path, nfolds=5, bs=8, train_size=256, xtra_tfms=None, seed=None, **
+        db_kwargs):
+    """
+    Create databunches for segmentation using k-fold cross-validation
+
+    path: path to the csv linking image paths to run-length encoded masks
+    nfolds: number of folds for cross-validation
+    bs: batch size
+    train_size: size to which image are to be resized
+    xtra_tfms: additional transforms to basic fastai ones
+
+    yield: nfolds databunches with train and validation datasets
+    """
+    kf = KFold(n_splits=nfolds, shuffle=True, random_state=seed)
+    train_list = (PneumoSegmentationList.
+                  from_csv(path.parent, path.name))
+    for _, valid_idx in kf.split(np.arange(len(train_list))):
+        db = (
+            train_list.split_by_idx(valid_idx).
+            label_from_df(
+                cols=[0, 1],
+                classes=['bg', 'pneum'],
+                label_cls=SoftmaxMaskList, train_path=path.parent).
+            transform(
+                get_transforms(do_flip=False, xtra_tfms=xtra_tfms),
+                size=train_size, tfm_y=True).
+            databunch(
+                bs=bs, num_workers=0, **db_kwargs).
+            normalize(imagenet_stats))
+        yield db
+
+
+def load_data_kfold_mtl(
+        path, nfolds=5, bs=8, train_size=256, xtra_tfms=None, **db_kwargs):
     """
     Create databunches for multi-task learning (classification+segmentation)
     using k-fold cross-validation
@@ -438,6 +488,7 @@ def load_data_kfold_mtl(path, nfolds=5, bs=8, train_size=256):
     nfolds: number of folds for cross-validation
     bs: batch size
     train_size: size to which image are to be resized
+    xtra_tfms: additional transforms to basic fastai ones
 
     yield: nfolds databunches with train and validation datasets
     """
@@ -452,8 +503,9 @@ def load_data_kfold_mtl(path, nfolds=5, bs=8, train_size=256):
                 classes=['bg', 'pneum'],
                 label_cls=MultiTaskLabelList, train_path=path.parent).
             transform(
-                get_transforms(do_flip=False),
+                get_transforms(do_flip=False, xtra_tfms=xtra_tfms),
                 size=train_size, tfm_y=True).
             databunch(
-                bs=bs, num_workers=0))
+                bs=bs, num_workers=0, **db_kwargs).
+            normalize(imagenet_stats))
         yield db

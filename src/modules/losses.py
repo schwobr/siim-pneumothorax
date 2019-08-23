@@ -138,6 +138,7 @@ class URLoss():
     func: nn.Module
     loss: torch.Tensor = None
     reduction: str = 'mean'
+    do_spatial_reduc: bool = False
 
     def __post_init__(self):
         self.func.reduction = 'none'
@@ -152,7 +153,11 @@ class URLoss():
         return: reduced version of loss according to self.reduction
         """
         self.func.reduction = 'none'
+        target = target.squeeze(1)
         self.loss = self.func(input, target)
+        if self.do_spatial_reduc:
+            self.loss = self.loss.view(self.loss.size(0), -1)
+            self.loss = self.loss.mean(-1)
         if self.reduction == 'mean':
             return self.loss.mean()
         elif self.reduction == 'sum':

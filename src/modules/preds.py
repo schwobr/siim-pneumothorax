@@ -22,8 +22,8 @@ def pred_batch_mtl(self, batch=None, test_size=256):
              target categories, target masks)
     """
     pred_cats, pred_masks = self.pred_batch(batch=batch)
-    pred_cats = nn.Softmax(dim=1)(pred_cats.cuda())
-    pred_masks = nn.Softmax(dim=1)(pred_masks.cuda())
+    pred_cats = nn.Softmax(dim=1)(pred_cats.to(self.data.device))
+    pred_masks = nn.Softmax(dim=1)(pred_masks.to(self.data.device))
 
     n = pred_masks.shape[0]
     targ_cats, targ_masks = batch[1]
@@ -41,13 +41,16 @@ def pred_batch_mtl(self, batch=None, test_size=256):
 Learner.pred_batch_mtl = pred_batch_mtl
 
 
-def get_best_thr(learner, plot=True):
+def get_best_thr(learner, plot=True, test_size=256, fig_path=None, exp=None):
     """
     Computes best probability threshold to get highest dice score
     on validation set
 
     learner: Learner object to compute dices on
     plot: whether to plot the dice curve or not
+    test_size: size of test images
+    fig_path: path to specify to save the plotted figure. Requires plot=True.
+    exp: neptune Experience object to pass to send plots to neptune.ml
 
     return: best found threshold
     """
@@ -62,6 +65,10 @@ def get_best_thr(learner, plot=True):
         plt.vlines(x=best_thr, ymin=dices.min(), ymax=dices.max())
         plt.text(best_thr+0.03, best_dice-0.01,
                  f'DICE = {best_dice:.3f}', fontsize=14)
+        if fig_path:
+            plt.savefig(fig_path)
+        if exp:
+            exp.log_image('thr curve', fig_path)
         plt.show()
 
     return best_thr
@@ -171,9 +178,9 @@ def create_submission(learner, path, test_size=256, thr=0.5):
               5e-3*test_size**2, ...] = 0.0
         idxs = next(learner.data.test_dl.sampler_iter)
         for k, pred in enumerate(preds.squeeze(1)):
-            y = pred.numpy()
+            y = (pred > thr).float().numpy()
             y = cv2.resize(y, (1024, 1024), interpolation=cv2.INTER_CUBIC)
-            y = (y > thr).astype(np.uint8)*255
+            y = (y > 0.5).astype(np.uint8)*255
             id = learner.data.test_ds.items[idxs[k]].with_suffix('').name
             rle = mask2rle(y.T, *y.shape[-2:])
             sub.loc[idxs[k]] = [id, rle]
@@ -226,13 +233,48 @@ def create_submission_mtl(learner, path, test_size=256, thr=0.5, thr_clf=0.5):
             if cat < thr_clf:
                 rle = '-1'
             else:
-                mask = mask.numpy()
+                mask = (mask > thr).float().numpy()
                 mask = cv2.resize(
                     mask, (1024, 1024),
                     interpolation=cv2.INTER_AREA)
-                mask = (mask > thr).astype(np.uint8)*255
+                mask = (mask > 0.5).astype(np.uint8)*255
                 rle = mask2rle(mask.T, *mask.shape[-2:])
             id = learner.data.test_ds.items[idxs[k]].with_suffix('').name
+            sub.loc[idxs[k]] = [id, rle]
+    sub.to_csv(path, index=False)
+    return sub
+
+
+def create_submission_kfold(
+        learner, path, pred_path, n_folds=5, test_size=256, thr=0.5):
+    """
+    Create submission file for kaggle
+
+    learner: Learner object to get predictions with
+    path: path to submission file
+    pred_path: path to folder where probability tensors are stored
+    n_folds: number of folds for cross-validation
+    test_size: size of test images
+    thr: probability threshold
+
+    return: dataframe corresponding to submission file
+    """
+    sub = pd.DataFrame(columns=['ImageId', 'EncodedPixels'])
+    n = len(learner.data.test_dl)
+    for i in tqdm(n):
+        preds = 0
+        for f in range(n_folds):
+            preds += torch.load(pred_path/str(f)/f'mask_{i}.t')
+        preds /= n_folds
+        preds[preds.view(preds.shape[0], -1).sum(-1) <
+              1e-3*test_size**2, ...] = 0.0
+        idxs = np.arange(i*n, (i+1)*n)
+        for k, pred in enumerate(preds.squeeze(1)):
+            y = (pred > thr).float().numpy()
+            y = cv2.resize(y, (1024, 1024), interpolation=cv2.INTER_AREA)
+            y = (y > 0.5).astype(np.uint8)*255
+            id = learner.data.test_ds.items[idxs[k]].with_suffix('').name
+            rle = mask2rle(y.T, *y.shape[-2:])
             sub.loc[idxs[k]] = [id, rle]
     sub.to_csv(path, index=False)
     return sub
@@ -270,11 +312,11 @@ def create_submission_kfold_mtl(
             if cat < thr_clf:
                 rle = '-1'
             else:
-                mask = mask.numpy()
+                mask = (mask > thr).float().numpy()
                 mask = cv2.resize(
                     mask, (1024, 1024),
                     interpolation=cv2.INTER_AREA)
-                mask = (mask > thr).astype(np.uint8)*255
+                mask = (mask > 0.5).astype(np.uint8)*255
                 rle = mask2rle(mask.T, *mask.shape[-2:])
             id = learner.data.test_ds.items[idxs[k]].with_suffix('').name
             sub.loc[idxs[k]] = [id, rle]
@@ -282,7 +324,7 @@ def create_submission_kfold_mtl(
     return sub
 
 
-def save_preds(learner, path):
+def save_preds_mtl(learner, path):
     """
     Save probability tensors for test set on multi-task learning problem
 
@@ -297,3 +339,18 @@ def save_preds(learner, path):
         y_mask = nn.Softmax(dim=1)(y_mask)[:, 1]
         torch.save(y_cat, path/f'cat_{k}.t')
         torch.save(y_mask, path/f'mask_{k}.t')
+
+
+def save_preds(learner, path):
+    """
+    Save probability tensors for test set on segmentation problem
+
+    learner: Learner object to make predictions with
+    path: path to folder where tensors will be saved
+    """
+    if not path.is_dir():
+        path.mkdir()
+    for k, batch in enumerate(learner.data.test_dl):
+        y = learner.pred_batch(batch=batch)
+        y = nn.Softmax(dim=1)(y)[:, 1]
+        torch.save(y, path/f'mask_{k}.t')

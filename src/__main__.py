@@ -1,6 +1,6 @@
 import initialize
-import train_mtl_kfold
+import train_seg
 
 if __name__ == '__main__':
     initialize.run()
-    train_mtl_kfold.run()
+    train_seg.run()

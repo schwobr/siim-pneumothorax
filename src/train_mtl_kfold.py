@@ -16,7 +16,9 @@ from modules.callbacks import (
     AccumulateStep, MTLLossCallback, NeptuneCallback)
 from modules.files import getNextFilePath
 from modules.preds import (
-    save_preds, get_best_thrs_mtl, create_submission_kfold_mtl)
+    save_preds_mtl, get_best_thrs_mtl, create_submission_kfold_mtl)
+from modules.transform import gaussian_noise
+from modules.optim import RangerW
 
 
 def run():
@@ -40,7 +42,7 @@ def run():
     for k, db in enumerate(
         load_data_kfold_mtl(
             cfg.LABELS, bs=cfg.BATCH_SIZE,
-            train_size=cfg.TRAIN_SIZE)):
+            train_size=cfg.TRAIN_SIZE, xtra_tfms=[gaussian_noise()])):
         print(f'fold {k}')
 
         learner = multi_task_unet_learner(
@@ -48,7 +50,7 @@ def run():
             pretrained=cfg.PRETRAINED, loss_func=MTLLoss(
                 CrossEntropyFlat(),
                 CrossEntropyFlat(axis=1)),
-            wd=cfg.WD, model_dir=cfg.MODELS_PATH,
+            wd=cfg.WD, model_dir=cfg.MODELS_PATH, opt_func=RangerW,
             metrics=[mtl_metric(dice, dim=1),
                      mtl_metric(accuracy, dim=0),
                      average_mtl_metric([dice, accuracy],
@@ -87,7 +89,7 @@ def run():
         fold_name = 'uf_' + fold_name
 
         learner.fit_one_cycle(
-            cfg.UNFROZE_EPOCHS, slice(cfg.LR/100, cfg.LR/5),
+            cfg.UNFROZE_EPOCHS, slice(cfg.LR/500, cfg.LR/10),
             callbacks=[
                 SaveModelCallback(
                     learner, monitor='dice_accuracy', name=fold_name),
@@ -116,7 +118,7 @@ def run():
             test_list, label=[test_list.items[0], '-1'],
             tfms=(), tfm_y=True)
 
-        save_preds(learner, pred_path/str(k))
+        save_preds_mtl(learner, pred_path/str(k))
 
     exp = project.create_experiment(
         name=save_name, description='k-fold mtl training',

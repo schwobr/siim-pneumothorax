@@ -43,6 +43,8 @@ from io import BytesIO
 from enum import IntEnum
 import sys
 import neptune
+import itertools as it
+import math
 
 from skimage.morphology import label
 from sklearn.model_selection import KFold, GridSearchCV
@@ -55,17 +57,18 @@ import torch
 import torch.nn as nn
 from torch.utils.data import WeightedRandomSampler, Sampler
 from torch.optim import SGD
+from torch.optim.optimizer import Optimizer
 
 from fastai.vision.data import SegmentationItemList, SegmentationLabelList, ImageList, imagenet_stats
 from fastai.data_block import FloatList, FloatItem, ItemList, PreProcessor
 from fastai.basic_data import DatasetType, DataBunch
 from fastai.basic_train import Learner
-from fastai.train import GradientClipping
+from fastai.train import GradientClipping, AccumulateScheduler
 from fastai.callback import OptimWrapper
 from fastai.core import *
 from fastai.torch_core import to_device, flatten_model, ParameterModule
 from fastai.layers import CrossEntropyFlat, SequentialEx
-from fastai.vision.image import Image, ImageSegment, image2np, pil2tensor
+from fastai.vision.image import Image, ImageSegment, image2np, pil2tensor, TfmLighting
 from fastai.vision.transform import get_transforms
 from fastai.vision.learner import unet_learner, cnn_learner
 import fastai.vision.models as mod
@@ -92,11 +95,14 @@ FULL_TRAIN_PATH = DATA/'dicom-images-train'
 FULL_TEST_PATH = DATA/'dicom-images-test'
 FULL_SIZE_TRAIN_PATH = DATA/'train'
 FULL_SIZE_TEST_PATH = DATA/'test'
+#TRAIN_PATH = FULL_SIZE_TRAIN_PATH
+#TEST_PATH = FULL_SIZE_TEST_PATH
 TRAIN_PATH = DATA/('train'+str(TRAIN_SIZE))
 TEST_PATH = DATA/('test'+str(TEST_SIZE))
 MODELS_PATH = PROJECT_PATH/'models/'
 SUB_PATH = PROJECT_PATH/'submissions/'
 LABELS_OLD = DATA/'train-rle.csv'
+#LABELS = DATA/'train-rle-fastai2.csv'
 LABELS = DATA/f'train-rle{TRAIN_SIZE}.csv'
 LABELS_POS = DATA/'train-rle-fastai_pos.csv'
 LABELS_CLASSIF = DATA/f'train-rle-clf{TRAIN_SIZE}.csv'
@@ -115,6 +121,22 @@ PRETRAINED = True
 MODEL = 'resnet34'
 CLASSES = ['pneum']
 ACT = 'sigmoid'
+
+SEED = 42
+```
+
+```{python Collapsed=false}
+os.environ['NEPTUNE_API_TOKEN']="eyJhcGlfYWRkcmVzcyI6Imh0dHBzOi8vdWkubmVwdHVuZS5tbCIsImFwaV9rZXkiOiJjOTJkZmE2Yy03MDQzLTQwN2QtYTU1Yy0yNzBiZDY3MTEyODkifQ=="
+os.environ['NEPTUNE_PROJECT']="schwobr/SIIM-Pneumothorax"
+os.environ['NEPTUNE_NOTEBOOK_ID']="d3f06d13-4d0d-4185-9fc0-4178915bdb35"
+```
+
+```{python Collapsed=false}
+if SEED is not None:
+    torch.manual_seed(SEED)
+    np.random.seed(SEED)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 ```
 
 ```{python hidden=TRUE, Collapsed=false}
@@ -459,6 +481,19 @@ show(img)
 show_dcm_info(fn)
 ```
 
+```{python Collapsed=false}
+l = []
+c = 0
+for fn in TRAIN_PATH.glob('**/*.dcm'):
+    ds = pydicom.dcmread(str(fn))
+    id = ds.PatientID
+    if id in l:
+        print(id)
+        c += 1
+    else:
+        l.append(id)
+```
+
 ```{python hidden=TRUE, Collapsed=false}
 img.shape
 ```
@@ -656,14 +691,17 @@ def load_data(path, bs=8, train_size=256):
 ```
 
 ```{python hidden=TRUE, Collapsed=false}
-def load_data_softmax(path, bs=8, train_size=256):
+def load_data_softmax(path, bs=8, train_size=256, sample_pct=None, xtra_tfms=None, seed=42, **db_kwargs):
     train_list = (PneumoSegmentationList.
-                  from_csv(path.parent, path.name).
-                  split_by_rand_pct(valid_pct=0.2).
-                  label_from_df(cols=[0, 1], classes=['bg', 'pneum'], label_cls=SoftmaxMaskList, train_path=path.parent).
-                  transform(get_transforms(do_flip=False), size=train_size, tfm_y=True).
-                  databunch(bs=bs, num_workers=0).
-                  normalize(imagenet_stats))
+                  from_csv(path.parent, path.name))
+    if sample_pct is not None:
+        train_list = train_list.use_partial_data(sample_pct=sample_pct, seed=seed)
+    train_list = (train_list.
+                 split_by_rand_pct(valid_pct=0.2, seed=seed).
+                 label_from_df(cols=[0, 1], classes=['bg', 'pneum'], label_cls=SoftmaxMaskList, train_path=path.parent).
+                 transform(get_transforms(do_flip=False, xtra_tfms=xtra_tfms), size=train_size, tfm_y=True).
+                 databunch(bs=bs, num_workers=0, **db_kwargs).
+                 normalize(imagenet_stats))
     return train_list
 ```
 
@@ -681,13 +719,13 @@ def load_data_classif(path, bs=8, train_size=256):
 ```
 
 ```{python hidden=TRUE, Collapsed=false}
-def load_data_mtl(path, bs=8, train_size=256):
+def load_data_mtl(path, bs=8, train_size=256, xtra_tfms=None, **kwargs):
     train_list = (MultiTaskList.
                   from_csv(path.parent, path.name).
                   split_by_rand_pct(valid_pct=0.2).
                   label_from_df(cols=[0, 1], classes=['bg', 'pneum'], label_cls=MultiTaskLabelList, train_path=path.parent).
-                  transform(get_transforms(do_flip=False), size=train_size, tfm_y=True).
-                  databunch(bs=bs, num_workers=0))
+                  transform(get_transforms(do_flip=False, xtra_tfms=xtra_tfms), size=train_size, tfm_y=True).
+                  databunch(bs=bs, num_workers=0, **kwargs))
     return train_list
 ```
 
@@ -768,6 +806,41 @@ def multi_task_unet_learner(*args, **kwargs):
     return unet_learn
 ```
 
+```{python Collapsed=false}
+def replace_bn(learner, m, G=32):
+    for n, ch in m.named_children():
+        if isinstance(ch, nn.BatchNorm2d):
+            new_layer = to_device(nn.GroupNorm(G, ch.num_features, ch.eps,  ch.affine), learner.data.device)
+            m._modules[n] = new_layer
+            found = False
+            for lg in learner.layer_groups:
+                for k, c in lg.named_children():
+                    if c is ch:
+                        lg._modules[k] = new_layer
+                        found = True
+                        break
+                if found: break
+    for ch in m.children():
+        replace_bn(learner, ch)
+    
+    if hasattr(learner, 'opt'):
+        learner.create_opt(learner.opt.lr, wd=learner.wd)
+```
+
+<!-- #region {"Collapsed": "true"} -->
+### Transform
+<!-- #endregion -->
+
+```{python Collapsed=false}
+def _gaussian_noise(x, mean=0, min_std=5e-3, max_std=0.05):
+    c, h, w = x.shape
+    std = random.random()*(max_std-min_std)+min_std
+    m = torch.normal(torch.full((h, w), mean), torch.full((h, w), std))        
+    return x.add_(torch.stack([m]*c))
+    
+gaussian_noise = TfmLighting(_gaussian_noise)
+```
+
 <!-- #region {"heading_collapsed": true, "Collapsed": "true"} -->
 ### Metrics
 <!-- #endregion -->
@@ -821,8 +894,8 @@ def mtl_scores(learner, thrs, ds_type=DatasetType.Valid):
     pos_count = 0
     for x, targs in tqdm(dl):
         y_cat, y_mask = learner.pred_batch(batch=(x, targs))
-        y_cat = nn.Softmax(dim=1)(y_cat.cuda())
-        y_mask = nn.Softmax(dim=1)(y_mask.cuda())
+        y_cat = nn.Softmax(dim=1)(y_cat.to(learner.data.device))
+        y_mask = nn.Softmax(dim=1)(y_mask.to(learner.data.device))
         n = y_mask.shape[0]
         targ_cats, targ_masks = targs
         targ_masks = targ_masks.float().view(n, -1)
@@ -877,6 +950,135 @@ def dice_overall(learner, thrs, ds_type=DatasetType.Valid):
             union[u0] = 2
             dices[k] += (2. * intersect / union).mean().cpu()
     return dices/len(dl)
+```
+
+<!-- #region {"Collapsed": "true"} -->
+### Optim 
+<!-- #endregion -->
+
+```{python Collapsed=false}
+class Ranger(Optimizer):
+
+    def __init__(
+            self, params, lr=1e-3, alpha=0.5, betas=(.9, 0.999),
+            eps=1e-8, weight_decay=0):
+        # parameter checks
+        if not 0.0 <= alpha <= 1.0:
+            raise ValueError(f'Invalid slow update rate: {alpha}')
+        if not lr > 0:
+            raise ValueError(f'Invalid Learning Rate: {lr}')
+        if not eps > 0:
+            raise ValueError(f'Invalid eps: {eps}')
+
+        # prep defaults and init torch.optim base
+        defaults = dict(lr=lr, betas=betas, eps=eps,
+                        weight_decay=weight_decay)
+        super().__init__(params, defaults)
+
+        # look ahead params
+        self.alpha = alpha
+
+
+        # radam buffer for state
+        self.radam_buffer = [[None, None, None] for ind in range(10)]
+
+        # lookahead weights
+        self.slow_weights = [[p.clone().detach() for p in group['params']]
+                             for group in self.param_groups]
+
+        # don't use grad for lookahead weights
+        for w in it.chain(*self.slow_weights):
+            w.requires_grad = False
+
+    def __setstate__(self, state):
+        print("set state called")
+        super(Ranger, self).__setstate__(state)
+
+    def step(self, closure=None):
+        # note - below is commented out b/c I have other work that passes back
+        # the loss as a float, and thus not a callable closure.
+        # Uncomment if you need to use the actual closure...
+
+        # if closure is not None:
+        # loss = closure()
+
+        # ------------ radam
+        for group in self.param_groups:
+
+            for p in group['params']:
+                if p.grad is None:
+                    continue
+                grad = p.grad.data.float()
+                if grad.is_sparse:
+                    raise RuntimeError(
+                        'RAdam does not support sparse gradients')
+
+                p_data_fp32 = p.data.float()
+
+                state = self.state[p]
+
+                if len(state) == 0:
+                    state['step'] = 0
+                    state['exp_avg'] = torch.zeros_like(p_data_fp32)
+                    state['exp_avg_sq'] = torch.zeros_like(p_data_fp32)
+                else:
+                    state['exp_avg'] = state['exp_avg'].type_as(p_data_fp32)
+                    state['exp_avg_sq'] = state['exp_avg_sq'].type_as(
+                        p_data_fp32)
+
+                exp_avg, exp_avg_sq = state['exp_avg'], state['exp_avg_sq']
+                beta1, beta2 = group['betas']
+
+                exp_avg_sq.mul_(beta2).addcmul_(1 - beta2, grad, grad)
+                exp_avg.mul_(beta1).add_(1 - beta1, grad)
+
+                state['step'] += 1
+                buffered = self.radam_buffer[int(state['step'] % 10)]
+                if state['step'] == buffered[0]:
+                    N_sma, step_size = buffered[1], buffered[2]
+                else:
+                    buffered[0] = state['step']
+                    beta2_t = beta2 ** state['step']
+                    N_sma_max = 2 / (1 - beta2) - 1
+                    N_sma = N_sma_max - 2 * \
+                        state['step'] * beta2_t / (1 - beta2_t)
+                    buffered[1] = N_sma
+                    if N_sma > 5:
+                        step_size = group['lr'] * (
+                            math.sqrt(
+                                (1 - beta2_t) * (N_sma - 4) / (N_sma_max - 4) *
+                                (N_sma - 2) / N_sma * N_sma_max /
+                                (N_sma_max - 2)) /
+                            (1 - beta1 ** state['step']))
+                    else:
+                        step_size = group['lr'] / (1 - beta1 ** state['step'])
+                    buffered[2] = step_size
+
+                if group['weight_decay'] != 0:
+                    p_data_fp32.add_(-group['weight_decay']
+                                     * group['lr'], p_data_fp32)
+
+                if N_sma > 5:
+                    denom = exp_avg_sq.sqrt().add_(group['eps'])
+                    p_data_fp32.addcdiv_(-step_size, exp_avg, denom)
+                else:
+                    p_data_fp32.add_(-step_size, exp_avg)
+
+                p.data.copy_(p_data_fp32)
+
+        # ---------------- end radam step
+    def look_ahead(self):
+        # look ahead tracking and updating if latest batch = k
+        for group, slow_weights in zip(self.param_groups, self.slow_weights):
+            for p, q in zip(group['params'], slow_weights):
+                if p.grad is None:
+                    continue
+                q.data.add_(self.alpha, p.data - q.data)
+                p.data.copy_(q.data)
+
+
+
+RangerW = partial(Ranger)
 ```
 
 <!-- #region {"heading_collapsed": true, "Collapsed": "true"} -->
@@ -945,25 +1147,28 @@ class MTLLoss(nn.Module):
 ```{python hidden=TRUE, Collapsed=false}
 @dataclass
 class URLoss():
-    func : nn.Module
-    loss : torch.Tensor = None
-    reduction : str = 'mean'
-    
+    func: nn.Module
+    loss: torch.Tensor = None
+    reduction: str = 'mean'
+    do_spatial_reduc: bool = False
+
     def __post_init__(self):
         self.func.reduction = 'none'
-        
+
     def __call__(self, input, target):
+
         self.func.reduction = 'none'
+        target = target.squeeze(1)
         self.loss = self.func(input, target)
-        if self.reduction == 'mean': return self.loss.mean()
-        elif self.reduction == 'sum': return self.loss.sum()
-        else: return self.loss
-        
-    def __getattr__(self, name):
-        return getattr(self.func, name)
-    
-    def __setstate__(self, data): 
-        self.__dict__.update(data)
+        if self.do_spatial_reduc:
+            self.loss = self.loss.view(self.loss.size(0), -1)
+            self.loss = self.loss.mean(-1)
+        if self.reduction == 'mean':
+            return self.loss.mean()
+        elif self.reduction == 'sum':
+            return self.loss.sum()
+        else:
+            return self.loss
 ```
 
 ```{python hidden=TRUE, Collapsed=false}
@@ -1094,7 +1299,7 @@ def acc_create_opt(self, lr, wd=0.):
         "Create optimizer with `lr` learning rate and `wd` weight decay."
         self.opt = AccumulateOptimWrapper.create(self.opt_func, lr, self.layer_groups,
                                          wd=wd, true_wd=self.true_wd, bn_wd=self.bn_wd)
-Learner.create_opt = acc_create_opt   
+#Learner.create_opt = acc_create_opt   
 ```
 
 ```{python hidden=TRUE, Collapsed=false}
@@ -1136,6 +1341,18 @@ class AccumulateStep(LearnerCallback):
             self.acc_batches = 0
 ```
 
+```{python Collapsed=false}
+class LookAhead(LearnerCallback):
+    def __init__(self, *args, k=6, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.k = k
+        
+    def on_step_end(self, iteration, **kwargs):
+        if iteration == 0: return
+        if iteration % self.k == 0:
+            self.learn.opt.look_ahead()
+```
+
 ```{python hidden=TRUE, Collapsed=false}
 class MonitorGrad(LearnerCallback):
     def __init__(self, *args, **kwargs):
@@ -1175,6 +1392,7 @@ class NeptuneCallback(LearnerCallback):
 
     def on_epoch_end(self, last_metrics, epoch, **kwargs):
         metric_names = [met.__name__ for met in self.learn.metrics]
+        self.exp.send_metric('valid_loss', epoch, last_metrics[0])
         for m, v in zip(metric_names, last_metrics[1:]):
             self.exp.send_metric(m, epoch, v)
 
@@ -1413,12 +1631,12 @@ for LR in [1e-5, 1e-4, 1e-3, 1e-2]:
 ## Training
 <!-- #endregion -->
 
-<!-- #region {"heading_collapsed": true, "Collapsed": "true"} -->
+<!-- #region {"heading_collapsed": true, "Collapsed": "false"} -->
 ### Frozen training
 <!-- #endregion -->
 
 ```{python hidden=TRUE, Collapsed=false}
-db = load_data_softmax(LABELS, bs=BATCH_SIZE, train_size=TRAIN_SIZE)
+db = load_data_softmax(LABELS, bs=BATCH_SIZE, train_size=TRAIN_SIZE, sample_pct=0.3, seed=SEED, xtra_tfms=[gaussian_noise()])
 ```
 
 ```{python hidden=TRUE, Collapsed=false}
@@ -1426,7 +1644,7 @@ db.show_batch(rows=3, cmap=plt.cm.bone)
 ```
 
 ```{python hidden=TRUE, Collapsed=false}
-clf_name = f'backbone_clf_{MODEL}'
+clf_name = f'backbone_clf_{MODEL}_{TRAIN_SIZE}'
 clf_name = f'{clf_name}_{getNextFilePath(MODELS_PATH, clf_name)-1}.pth'
 clf_name
 ```
@@ -1443,21 +1661,25 @@ save_name
 
 ```{python hidden=TRUE, Collapsed=false}
 learner = unet_learner(db, models[MODEL], pretrained=PRETRAINED,
-                       loss_func=URLoss(CrossEntropyFlat(axis=1)),
-                       wd=WD, model_dir=MODELS_PATH, metrics=[soft_dice])
+                       loss_func=URLoss(nn.CrossEntropyLoss(), reduction='sum', do_spatial_reduc=True),
+                       opt_func=RangerW,
+                       wd=WD, model_dir=MODELS_PATH, metrics=[dice])
+```
+
+```{python Collapsed=false}
+#replace_bn(learner, learner.model)
 ```
 
 ```{python hidden=TRUE, Collapsed=false}
-weights = get_weights_sampler(db, beta=0.5)
-weights
+#weights = get_weights_sampler(db, beta=0.5)
 ```
 
 ```{python hidden=TRUE, Collapsed=false}
-sampler = RandomSampler(len(db.train_ds), weights=torch.tensor(weights))
+#sampler = RandomSampler(len(db.train_ds), weights=torch.tensor(weights))
 ```
 
 ```{python hidden=TRUE, Collapsed=false}
-learner.data.train_dl = db.train_dl.new(shuffle=False, sampler=sampler)
+#learner.data.train_dl = db.train_dl.new(shuffle=False, sampler=sampler)
 ```
 
 ```{python hidden=TRUE, Collapsed=false}
@@ -1469,7 +1691,7 @@ learner.data.train_dl = db.train_dl.new(shuffle=False, sampler=sampler)
 ```
 
 ```{python hidden=TRUE, Collapsed=false}
-learner = learner.clip_grad(1.)
+#learner = learner.clip_grad(1.)
 ```
 
 ```{python hidden=TRUE, Collapsed=false}
@@ -1482,6 +1704,10 @@ learner = learner.clip_grad(1.)
 
 ```{python hidden=TRUE, Collapsed=false}
 #learner.recorder.plot()
+```
+
+```{python Collapsed=false}
+project = neptune.init('schwobr/SIIM-Pneumothorax')
 ```
 
 ```{python hidden=TRUE, Collapsed=false}
@@ -1505,15 +1731,19 @@ suff
 #sys.stdout = open('/dev/stdout', 'w')
 ```
 
+```{python Collapsed=false}
+#learner.unfreeze()
+```
+
 ```{python hidden=TRUE, Collapsed=false}
 learner.fit_one_cycle(
-    50, slice(LR),
+    2, LR,
     callbacks=[
-        SaveModelCallback(learner, monitor='valid_loss', name=save_name),
-        UpdateSamplerCallback(learner, do_update=False),
-        AccumulateStep(learner, 64//BATCH_SIZE),
-        LearnerTensorboardWriter(learner, LOG, save_name+suff, loss_iters=10,
-                                 hist_iters=100, stats_iters=10)])
+        SaveModelCallback(learner, monitor='dice', name=save_name),
+        AccumulateScheduler(learner, min(8, 64 // BATCH_SIZE)),
+        LookAhead(learner, k=max(6, 64//BATCH_SIZE)),
+        NeptuneCallback(learner, project, name=save_name, params={'lr': LR, 'wd': WD, 'size':TRAIN_SIZE})
+    ])
 ```
 
 ```{python hidden=TRUE, Collapsed=false}
@@ -1529,7 +1759,7 @@ learner.fit_one_cycle(
 ```
 
 ```{python hidden=TRUE, Collapsed=false}
-#learner.recorder.plot_metrics()
+learner.recorder.plot_metrics()
 ```
 
 ```{python hidden=TRUE, Collapsed=false}
@@ -2196,12 +2426,16 @@ x = xs[2][0][0].float()
 Image((x-torch.min(x))/(torch.max(x)-torch.min(x)))
 ```
 
-<!-- #region {"Collapsed": "false"} -->
+<!-- #region {"Collapsed": "true"} -->
 ### MultiTask Learning
 <!-- #endregion -->
 
 ```{python Collapsed=false}
-db = load_data_mtl(LABELS, bs=BATCH_SIZE, train_size=TRAIN_SIZE)
+db = load_data_mtl(LABELS, bs=BATCH_SIZE, train_size=TRAIN_SIZE, device=torch.device('cpu'))
+```
+
+```{python Collapsed=false}
+db.device
 ```
 
 ```{python Collapsed=false}
@@ -2227,9 +2461,9 @@ save_name
 ```
 
 ```{python Collapsed=false}
-prev_save_name = f'mtl_{MODEL}_{512}'
-prev_save_name = f'{prev_save_name}_{getNextFilePath(MODELS_PATH, prev_save_name)-1}'
-prev_save_name = 'uf_fold2_mtl_resnet34_256_2'
+prev_save_name = f'uf_mtl_{MODEL}_{512}'
+prev_save_name = f'{prev_save_name}_{getNextFilePath(MODELS_PATH, prev_save_name)-3}'
+#prev_save_name = 'fold1_mtl_resnet34_256_2'
 prev_save_name
 ```
 
@@ -2241,8 +2475,12 @@ learner.load(prev_save_name)
 learner.model.log_vars.val
 ```
 
-```{python Collapsed=false, jupyter={'outputs_hidden': True}}
-learner.show_results(rows=10)
+```{python Collapsed=false}
+db.valid_ds[4][0]
+```
+
+```{python Collapsed=false}
+learner.show_results(rows=50)
 ```
 
 ```{python Collapsed=false}
@@ -2336,7 +2574,7 @@ learner.data.add_test(test_list, label=[test_list.items[0], '-1'], tfms=(), tfm_
 #learner.data.label_list.test.tfmargs = {'size': TEST_SIZE}
 ```
 
-```{python Collapsed=false}
+```{python Collapsed=false, jupyter={'outputs_hidden': True}}
 thr, thr_clf = get_best_thrs_mtl(learner, a=0.)
 ```
 

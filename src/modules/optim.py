@@ -2,18 +2,18 @@ import math
 import torch
 from torch.optim.optimizer import Optimizer
 import itertools as it
+from functools import partial
+from config import BATCH_SIZE
 
 
 class Ranger(Optimizer):
 
     def __init__(
-            self, params, lr=1e-3, alpha=0.5, k=6, betas=(.9, 0.999),
+            self, params, lr=1e-3, alpha=0.5, betas=(.9, 0.999),
             eps=1e-8, weight_decay=0):
         # parameter checks
         if not 0.0 <= alpha <= 1.0:
             raise ValueError(f'Invalid slow update rate: {alpha}')
-        if not 1 <= k:
-            raise ValueError(f'Invalid lookahead steps: {k}')
         if not lr > 0:
             raise ValueError(f'Invalid Learning Rate: {lr}')
         if not eps > 0:
@@ -24,14 +24,8 @@ class Ranger(Optimizer):
                         weight_decay=weight_decay)
         super().__init__(params, defaults)
 
-        # now we can get to work...
-        for group in self.param_groups:
-            group["step_counter"] = 0
-            # print("group step counter init")
-
         # look ahead params
         self.alpha = alpha
-        self.k = k
 
         # radam buffer for state
         self.radam_buffer = [[None, None, None] for ind in range(10)]
@@ -49,14 +43,6 @@ class Ranger(Optimizer):
         super(Ranger, self).__setstate__(state)
 
     def step(self, closure=None):
-        loss = None
-        # note - below is commented out b/c I have other work that passes back
-        # the loss as a float, and thus not a callable closure.
-        # Uncomment if you need to use the actual closure...
-
-        # if closure is not None:
-        # loss = closure()
-
         # ------------ radam
         for group in self.param_groups:
 
@@ -99,10 +85,12 @@ class Ranger(Optimizer):
                         state['step'] * beta2_t / (1 - beta2_t)
                     buffered[1] = N_sma
                     if N_sma > 5:
-                        step_size = group['lr'] * (math.sqrt(
-                            (1 - beta2_t) * (N_sma - 4) / (N_sma_max - 4) * (
-                             N_sma - 2) / N_sma * N_sma_max / (N_sma_max - 2))
-                             / (1 - beta1 ** state['step']))
+                        step_size = group['lr'] * (
+                            math.sqrt(
+                                (1 - beta2_t) * (N_sma - 4) / (N_sma_max - 4) *
+                                (N_sma - 2) / N_sma * N_sma_max /
+                                (N_sma_max - 2)) /
+                            (1 - beta1 ** state['step']))
                     else:
                         step_size = group['lr'] / (1 - beta1 ** state['step'])
                     buffered[2] = step_size
@@ -121,15 +109,14 @@ class Ranger(Optimizer):
 
         # ---------------- end radam step
 
+    def look_ahead(self):
         # look ahead tracking and updating if latest batch = k
         for group, slow_weights in zip(self.param_groups, self.slow_weights):
-            group['step_counter'] += 1
-            if group['step_counter'] % self.k != 0:
-                continue
             for p, q in zip(group['params'], slow_weights):
                 if p.grad is None:
                     continue
                 q.data.add_(self.alpha, p.data - q.data)
                 p.data.copy_(q.data)
 
-        return loss
+
+RangerW = partial(Ranger, k=max(6, 64//BATCH_SIZE))
